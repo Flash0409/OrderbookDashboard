@@ -12,6 +12,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, date
+from pathlib import Path
 
 # -- Page config ---------------------------------------------------------------
 st.set_page_config(
@@ -91,6 +92,7 @@ DEFAULT_PROJECT_SEQUENCE = pd.DataFrame({
 })
 
 SEQUENCE_COLUMNS = ["Sr.", "Project Name", "No. Of Cabinet", "Prod. Open Dt.", "SO No.", "Completed"]
+SEQUENCE_STATE_FILE = Path(__file__).with_name("project_sequence_state.json")
 
 
 # ==============================================================================
@@ -344,6 +346,23 @@ def _to_bool_series(series):
     return series.apply(_conv)
 
 
+def normalize_project_key(value):
+    """Normalize project name for case/space-insensitive matching."""
+    if pd.isna(value):
+        return ""
+    return "".join(str(value).strip().lower().split())
+
+
+def build_project_priority_map(project_sequence):
+    """Build priority map using normalized project names."""
+    seq = project_sequence.copy()
+    seq["_project_key"] = seq["Project Name"].apply(normalize_project_key)
+    seq = seq[seq["_project_key"] != ""].copy()
+    seq = seq.sort_values("Sr.", kind="stable")
+    seq = seq.drop_duplicates(subset=["_project_key"], keep="first")
+    return dict(zip(seq["_project_key"], seq["Sr."]))
+
+
 def normalize_sequence_df(df_in):
     """Normalize uploaded project sequence data into dashboard sequence schema."""
     if df_in is None or len(df_in) == 0:
@@ -362,7 +381,9 @@ def normalize_sequence_df(df_in):
     df = df[SEQUENCE_COLUMNS].copy()
     df["Project Name"] = df["Project Name"].astype(str).str.strip()
     df = df[~df["Project Name"].isin(["", "nan", "None"])].copy()
-    df = df.drop_duplicates(subset=["Project Name"], keep="last")
+    df["_project_key"] = df["Project Name"].apply(normalize_project_key)
+    df = df[df["_project_key"] != ""].copy()
+    df = df.drop_duplicates(subset=["_project_key"], keep="last")
 
     if len(df) == 0:
         return None, "No valid 'Project Name' values found in uploaded sheet."
@@ -381,11 +402,68 @@ def normalize_sequence_df(df_in):
 
     df = df.sort_values("Sr.", kind="stable").reset_index(drop=True)
     df["Sr."] = range(1, len(df) + 1)
+    df = df[SEQUENCE_COLUMNS].copy()
     return df, None
 
 
+def load_saved_project_sequence():
+    """Load project sequence from disk if available, else default."""
+    if not SEQUENCE_STATE_FILE.exists():
+        return DEFAULT_PROJECT_SEQUENCE.copy()
+
+    try:
+        saved_df = pd.read_json(SEQUENCE_STATE_FILE)
+    except Exception:
+        return DEFAULT_PROJECT_SEQUENCE.copy()
+
+    normalized_df, err = normalize_sequence_df(saved_df)
+    if err or normalized_df is None:
+        return DEFAULT_PROJECT_SEQUENCE.copy()
+    return normalized_df
+
+
+def set_project_sequence(df):
+    """Set session sequence and persist it to disk."""
+    normalized_df, err = normalize_sequence_df(df)
+    if err or normalized_df is None:
+        return False
+
+    st.session_state["project_sequence"] = normalized_df[SEQUENCE_COLUMNS].copy()
+    try:
+        st.session_state["project_sequence"].to_json(SEQUENCE_STATE_FILE, orient="records", indent=2)
+    except Exception as ex:
+        st.warning(f"Project sequence updated in session, but autosave failed: {ex}")
+    return True
+
+
 def load_sequence_from_excel(uploaded_file):
-    """Load first sheet/header in Excel that contains 'Project Name' column."""
+    """Load first sheet/header in Excel or CSV that contains 'Project Name' column."""
+    # Check if it's a CSV file
+    file_name = uploaded_file.name if hasattr(uploaded_file, 'name') else str(uploaded_file)
+    if file_name.lower().endswith('.csv'):
+        try:
+            # Try reading CSV with standard header
+            df = pd.read_csv(uploaded_file)
+            df.columns = df.columns.astype(str).str.strip()
+            if "Project Name" in df.columns:
+                return df, "CSV"
+            
+            # Try different header rows (up to 12)
+            uploaded_file.seek(0)
+            for skip_rows in range(12):
+                uploaded_file.seek(0)
+                try:
+                    df = pd.read_csv(uploaded_file, skiprows=skip_rows)
+                    df.columns = df.columns.astype(str).str.strip()
+                    if "Project Name" in df.columns:
+                        return df, "CSV"
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None, None
+    
+    # Handle Excel files
     xl = pd.ExcelFile(uploaded_file, engine="openpyxl")
     sheets = xl.sheet_names
 
@@ -421,8 +499,8 @@ def render_sequence_upload_controls(section_key):
     st.markdown("---")
     st.markdown("#### 📥 Upload Project Sequence")
     seq_file = st.file_uploader(
-        "Upload sequence file (.xlsx/.xlsm)",
-        type=["xlsx", "xlsm"],
+        "Upload sequence file (.xlsx/.xlsm/.csv)",
+        type=["xlsx", "xlsm", "csv"],
         key=f"{section_key}_seq_file",
         help="File must contain a 'Project Name' column. Other columns are optional: Sr., No. Of Cabinet, Prod. Open Dt., SO No., Completed."
     )
@@ -435,12 +513,12 @@ def render_sequence_upload_controls(section_key):
 
     if st.button("Apply Uploaded Sequence", key=f"{section_key}_seq_apply", type="primary"):
         if not seq_file:
-            st.warning("Please upload a sequence Excel file first.")
+            st.warning("Please upload a sequence file first.")
             return
 
         loaded_df, loaded_sheet = load_sequence_from_excel(seq_file)
         if loaded_df is None:
-            st.error("Could not find a valid sheet with 'Project Name' in the uploaded file.")
+            st.error("Could not find 'Project Name' column in the uploaded file.")
             return
 
         normalized_df, err = normalize_sequence_df(loaded_df)
@@ -459,15 +537,18 @@ def render_sequence_upload_controls(section_key):
             updated_df = normalized_df.copy()
         else:
             current_df["Project Name"] = current_df["Project Name"].astype(str).str.strip()
-            incoming_projects = set(normalized_df["Project Name"].astype(str).str.strip())
-            current_kept = current_df[~current_df["Project Name"].isin(incoming_projects)].copy()
+            current_df["_project_key"] = current_df["Project Name"].apply(normalize_project_key)
+            incoming_projects = set(normalized_df["Project Name"].apply(normalize_project_key))
+            current_kept = current_df[~current_df["_project_key"].isin(incoming_projects)].copy()
+            current_kept = current_kept.drop(columns=["_project_key"], errors="ignore")
             updated_df = pd.concat([current_kept, normalized_df], ignore_index=True)
             updated_df = updated_df.sort_values("Sr.", kind="stable").reset_index(drop=True)
             updated_df["Sr."] = range(1, len(updated_df) + 1)
 
-        st.session_state["project_sequence"] = updated_df[SEQUENCE_COLUMNS].copy()
+        set_project_sequence(updated_df)
+        source_name = loaded_sheet if loaded_sheet else "uploaded file"
         st.success(
-            f"Sequence updated from sheet '{loaded_sheet}'. Total projects: {len(updated_df):,}."
+            f"Sequence updated from {source_name}. Total projects: {len(updated_df):,}."
         )
         st.rerun()
 
@@ -564,10 +645,7 @@ def build_grn_by_project_sequence(df_oob, df_grn_today, project_sequence, stock_
     if len(grn_delivered) == 0:
         return pd.DataFrame()
 
-    priority_map = dict(zip(
-        project_sequence["Project Name"].str.strip(),
-        project_sequence["Sr."]
-    ))
+    priority_map = build_project_priority_map(project_sequence)
 
     grn_items = set(grn_delivered["Item"].unique())
     grn_qty_by_item = grn_delivered.groupby("Item").agg({
@@ -604,11 +682,31 @@ def build_grn_by_project_sequence(df_oob, df_grn_today, project_sequence, stock_
     else:
         proj_comp["Stock Qty"] = 0
 
-    proj_comp["Priority"] = proj_comp["Project Name"].map(priority_map).fillna(9999).astype(int)
+    proj_comp["_project_key"] = proj_comp["Project Name"].apply(normalize_project_key)
+    proj_comp["Priority"] = proj_comp["_project_key"].map(priority_map).fillna(9999).astype(int)
     proj_comp = proj_comp.sort_values(["Priority", "Component Code"]).reset_index(drop=True)
 
     # Filter out items with zero or negative Open Qty
     proj_comp = proj_comp[proj_comp["Open Qty"] > 0].copy()
+
+    # Include projects while GRN+Stock availability remains (allows partial fulfillment and reuse)
+    supply_map = {k: float(v["Qty"]) for k, v in grn_qty_by_item.items()}
+    if stock_map:
+        for k, v in stock_map.items():
+            supply_map[k] = supply_map.get(k, 0) + float(v)
+
+    keep_idx = []
+    remaining_supply = dict(supply_map)
+    for idx, row in proj_comp.sort_values(["Priority", "Component Code"]).iterrows():
+        comp_code = row["Component Code"]
+        avail = remaining_supply.get(comp_code, 0)
+        if avail > 0:
+            keep_idx.append(idx)
+            req = float(row["Open Qty"])
+            remaining_supply[comp_code] = max(0, avail - req)
+
+    proj_comp = proj_comp.loc[keep_idx].copy() if keep_idx else proj_comp.iloc[0:0].copy()
+    proj_comp = proj_comp.drop(columns=["_project_key"], errors="ignore")
 
     return ensure_arrow_compatible(proj_comp)
 
@@ -618,10 +716,7 @@ def build_stock_by_project_sequence(df_oob, stock_map, project_sequence):
     if not stock_map:
         return pd.DataFrame()
 
-    priority_map = dict(zip(
-        project_sequence["Project Name"].str.strip(),
-        project_sequence["Sr."]
-    ))
+    priority_map = build_project_priority_map(project_sequence)
 
     stock_items = {k for k, v in stock_map.items() if v > 0}
     oob_matching = df_oob[df_oob["Component Code"].isin(stock_items)].copy()
@@ -637,7 +732,8 @@ def build_stock_by_project_sequence(df_oob, stock_map, project_sequence):
         "Order Number": lambda x: ", ".join(sorted(set(str(v) for v in x if pd.notna(v) and str(v).strip() not in ("", "nan")))),
     })
 
-    proj_comp["Priority"] = proj_comp["Project Name"].map(priority_map).fillna(9999).astype(int)
+    proj_comp["_project_key"] = proj_comp["Project Name"].apply(normalize_project_key)
+    proj_comp["Priority"] = proj_comp["_project_key"].map(priority_map).fillna(9999).astype(int)
     proj_comp["Stock Qty"] = proj_comp["Component Code"].map(stock_map).fillna(0)
 
     # Filter out items with zero or negative Open Qty
@@ -645,6 +741,20 @@ def build_stock_by_project_sequence(df_oob, stock_map, project_sequence):
 
     # Sort by priority first, then component code
     proj_comp = proj_comp.sort_values(["Priority", "Component Code"]).reset_index(drop=True)
+
+    # Include projects while stock availability remains (allows partial fulfillment and reuse)
+    keep_idx = []
+    remaining_stock = dict(stock_map)
+    for idx, row in proj_comp.sort_values(["Priority", "Component Code"]).iterrows():
+        comp_code = row["Component Code"]
+        avail = remaining_stock.get(comp_code, 0)
+        if avail > 0:
+            keep_idx.append(idx)
+            req = float(row["Open Qty"])
+            remaining_stock[comp_code] = max(0, avail - req)
+
+    proj_comp = proj_comp.loc[keep_idx].copy() if keep_idx else proj_comp.iloc[0:0].copy()
+    proj_comp = proj_comp.drop(columns=["_project_key"], errors="ignore")
 
     return ensure_arrow_compatible(proj_comp)
 
@@ -798,26 +908,29 @@ def get_fulfillable_wo_map(df_oob, project_sequence, stock_map=None, grn_qty_map
     1. Build a supply pool per component (stock + GRN).
     2. For each component, collect all (project, Work Order Number, open_qty) rows
        and sort by project priority (asc) then Job Start Date (asc) then WO number.
-    3. Walk through, deducting each WO's open qty from remaining supply.
-       - Include WOs while remaining supply > 0 (partial fulfillment counts).
-       - Once supply hits 0, stop for that component.
-    4. Build two mappings:
+    3. Walk through projects in priority order, including WOs while supply > 0.
+       - Deduct allocated quantity from remaining supply after each WO.
+       - Supports partial fulfillment (includes WO even if supply < requirement).
+       - Stops when supply reaches 0.
+     4. Build three mappings:
        - comp_map:  {(project_name, component_code): "WO1, WO2, …"}
        - proj_map:  {project_name: "WO1, WO2, …"}  (union of all fulfillable WOs)
+         - proj_order_map: {project_name: "SO1, SO2, …"} (order numbers for those WOs)
 
     Uses 'Work Order Number' and 'Job Start Date' columns from the Orderbook.
 
     Returns:
-        tuple  –  (comp_map, proj_map)
+        tuple  –  (comp_map, proj_map, proj_order_map)
     """
     wo_col = "Work Order Number"
     date_col = "Job Start Date"
+    order_col = "Order Number"
     if wo_col not in df_oob.columns:
-        return {}, {}
+        return {}, {}, {}
 
     open_rows = df_oob[df_oob["Open Qty"] > 0].copy()
     if len(open_rows) == 0:
-        return {}, {}
+        return {}, {}, {}
 
     # Build available supply per component
     supply = {}
@@ -828,21 +941,23 @@ def get_fulfillable_wo_map(df_oob, project_sequence, stock_map=None, grn_qty_map
             supply[k] = supply.get(k, 0) + v
 
     # Priority map
-    priority_map = dict(zip(
-        project_sequence["Project Name"].str.strip(),
-        project_sequence["Sr."]
-    ))
+    priority_map = build_project_priority_map(project_sequence)
 
     # Per (Project, WO, Component) demand, keeping Job Start Date
     agg_dict = {"Open Qty": "sum"}
     if date_col in open_rows.columns:
         agg_dict[date_col] = "first"
+    if order_col in open_rows.columns:
+        agg_dict[order_col] = lambda x: ", ".join(
+            sorted(set(str(v) for v in x if pd.notna(v) and str(v).strip() not in ("", "nan")))
+        )
     wo_comp = open_rows.groupby(
         ["Project Name", wo_col, "Component Code"], as_index=False
     ).agg(agg_dict)
 
     # Add sorting keys
-    wo_comp["Priority"] = wo_comp["Project Name"].map(priority_map).fillna(9999).astype(int)
+    wo_comp["_project_key"] = wo_comp["Project Name"].apply(normalize_project_key)
+    wo_comp["Priority"] = wo_comp["_project_key"].map(priority_map).fillna(9999).astype(int)
     if date_col in wo_comp.columns:
         wo_comp["_sort_date"] = pd.to_datetime(wo_comp[date_col], format="mixed", dayfirst=True, errors="coerce")
     else:
@@ -853,9 +968,11 @@ def get_fulfillable_wo_map(df_oob, project_sequence, stock_map=None, grn_qty_map
     ).reset_index(drop=True)
 
     # Walk through each component's WOs in priority / date order
+    # Include WOs while supply availability remains (allows partial fulfillment and reuse)
     remaining_supply = dict(supply)
     comp_result = {}   # {(project, component): [wo_list]}
     proj_result = {}   # {project: set(wo_list)}
+    proj_order_result = {}  # {project: set(order_numbers)}
 
     for cc, grp in wo_comp.groupby("Component Code", sort=False):
         cc_rows = grp.sort_values(["Priority", "_sort_date", wo_col])
@@ -865,9 +982,14 @@ def get_fulfillable_wo_map(df_oob, project_sequence, stock_map=None, grn_qty_map
                 break
             wo_str = str(row[wo_col])
             proj = row["Project Name"]
+            req = float(row["Open Qty"])
             comp_result.setdefault((proj, cc), []).append(wo_str)
             proj_result.setdefault(proj, set()).add(wo_str)
-            remaining_supply[cc] = avail - row["Open Qty"]
+            if order_col in row and pd.notna(row[order_col]):
+                order_vals = [s.strip() for s in str(row[order_col]).split(",") if s.strip()]
+                if order_vals:
+                    proj_order_result.setdefault(proj, set()).update(order_vals)
+            remaining_supply[cc] = max(0, avail - req)
 
     comp_map = {k: ", ".join(v) for k, v in comp_result.items()}
 
@@ -879,7 +1001,13 @@ def get_fulfillable_wo_map(df_oob, project_sequence, stock_map=None, grn_qty_map
         ].drop_duplicates(subset=[wo_col]).sort_values(["_sort_date", wo_col])
         proj_map[proj] = ", ".join(proj_wos[wo_col].astype(str).tolist())
 
-    return comp_map, proj_map
+    proj_order_map = {
+        proj: ", ".join(sorted(vals))
+        for proj, vals in proj_order_result.items()
+        if vals
+    }
+
+    return comp_map, proj_map, proj_order_map
 
 
 # ==============================================================================
@@ -1067,7 +1195,7 @@ st.markdown(f'<div class="metric-card {mode_css}" style="padding:10px;margin-bot
 
 # -- Load / initialize project sequence in session state -----------------------
 if "project_sequence" not in st.session_state:
-    st.session_state["project_sequence"] = DEFAULT_PROJECT_SEQUENCE.copy()
+    st.session_state["project_sequence"] = load_saved_project_sequence()
 
 project_sequence = st.session_state["project_sequence"]
 
@@ -1183,7 +1311,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
     # TAB S2: Stock by Project Priority
     with tab_s2:
         st.subheader("Stock \u2014 Ordered by Project Priority")
-        st.caption("Components with stock, ordered by project priority.")
+        st.caption("Components cascade to projects by priority order. Remaining stock after each allocation can fulfill lower-priority projects.")
 
         project_sequence = st.session_state["project_sequence"]
         stock_by_proj = build_stock_by_project_sequence(df_oob_filtered, stock_map, project_sequence)
@@ -1201,7 +1329,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
             stock_proj_display = stock_by_proj.copy()
 
             # Add comma-separated fulfillable work orders per (project, component)
-            wo_map_stock, wo_proj_map_stock = get_fulfillable_wo_map(df_oob_filtered, project_sequence, stock_map=stock_map)
+            wo_map_stock, wo_proj_map_stock, wo_proj_order_map_stock = get_fulfillable_wo_map(df_oob_filtered, project_sequence, stock_map=stock_map)
             stock_proj_display["Fulfillable Work Orders"] = stock_proj_display.apply(
                 lambda r: wo_map_stock.get((r["Project Name"], r["Component Code"]), ""), axis=1
             )
@@ -1240,11 +1368,18 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
             if wo_proj_map_stock:
                 st.markdown("---")
                 st.subheader("\U0001F4CB Fulfillable Work Orders by Project")
-                st.caption("Work Orders that can be fulfilled (fully or partially) from current stock, sorted by Job Start Date.")
+                st.caption("Work Orders cascade by priority while stock remains. Partial fulfillment included. Sorted by Job Start Date.")
+                wo_proj_norm = {normalize_project_key(k): v for k, v in wo_proj_map_stock.items()}
+                wo_proj_order_norm = {normalize_project_key(k): v for k, v in wo_proj_order_map_stock.items()}
                 proj_wo_rows = []
                 for proj_name in project_sequence["Project Name"].str.strip():
-                    if proj_name in wo_proj_map_stock:
-                        proj_wo_rows.append({"Project Name": proj_name, "Fulfillable Work Orders": wo_proj_map_stock[proj_name]})
+                    proj_key = normalize_project_key(proj_name)
+                    if proj_key in wo_proj_norm:
+                        proj_wo_rows.append({
+                            "Project Name": proj_name,
+                            "Fulfillable Work Orders": wo_proj_norm[proj_key],
+                            "Order Number": wo_proj_order_norm.get(proj_key, ""),
+                        })
                 if proj_wo_rows:
                     proj_wo_df = pd.DataFrame(proj_wo_rows)
                     proj_wo_df.insert(0, "Sr.", range(1, len(proj_wo_df) + 1))
@@ -1467,7 +1602,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
                     if idx > 0:
                         sr_current = seq.at[idx, "Sr."]; sr_above = seq.at[idx-1, "Sr."]
                         seq.at[idx, "Sr."] = sr_above; seq.at[idx-1, "Sr."] = sr_current
-                        st.session_state["project_sequence"] = seq.sort_values("Sr.").reset_index(drop=True)
+                        set_project_sequence(seq.sort_values("Sr.").reset_index(drop=True))
                         st.rerun()
         with col_ctrl3:
             if st.button("\u2b07\ufe0f Move Down", key="stock_down"):
@@ -1477,7 +1612,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
                     if idx < len(seq) - 1:
                         sr_current = seq.at[idx, "Sr."]; sr_below = seq.at[idx+1, "Sr."]
                         seq.at[idx, "Sr."] = sr_below; seq.at[idx+1, "Sr."] = sr_current
-                        st.session_state["project_sequence"] = seq.sort_values("Sr.").reset_index(drop=True)
+                        set_project_sequence(seq.sort_values("Sr.").reset_index(drop=True))
                         st.rerun()
         with col_ctrl4:
             if st.button("\u2705 Mark Complete", key="stock_complete"):
@@ -1485,14 +1620,14 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
                     seq = st.session_state["project_sequence"]
                     idx = seq[seq["Project Name"] == selected_project].index[0]
                     seq.at[idx, "Completed"] = True
-                    st.session_state["project_sequence"] = seq; st.rerun()
+                    set_project_sequence(seq); st.rerun()
         with col_ctrl5:
             if st.button("\u21a9\ufe0f Unmark", key="stock_unmark"):
                 if selected_project:
                     seq = st.session_state["project_sequence"]
                     idx = seq[seq["Project Name"] == selected_project].index[0]
                     seq.at[idx, "Completed"] = False
-                    st.session_state["project_sequence"] = seq; st.rerun()
+                    set_project_sequence(seq); st.rerun()
 
         st.markdown("---")
         edited_sequence = st.data_editor(
@@ -1516,16 +1651,16 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
                 else:
                     completed_items = st.session_state["project_sequence"][st.session_state["project_sequence"]["Completed"] == True]
                     updated = pd.concat([edited_sequence, completed_items], ignore_index=True).sort_values("Sr.").reset_index(drop=True)
-                st.session_state["project_sequence"] = updated; st.rerun()
+                set_project_sequence(updated); st.rerun()
         with col_btn2:
             if st.button("\U0001F504 Reset to Default", key="stock_reset"):
-                st.session_state["project_sequence"] = DEFAULT_PROJECT_SEQUENCE.copy(); st.rerun()
+                set_project_sequence(DEFAULT_PROJECT_SEQUENCE.copy()); st.rerun()
         with col_btn3:
             if st.button("\U0001F5D1\uFE0F Remove Completed", key="stock_remove"):
                 seq = st.session_state["project_sequence"]
                 seq = seq[seq["Completed"] == False].copy()
                 seq["Sr."] = range(1, len(seq) + 1)
-                st.session_state["project_sequence"] = seq; st.rerun()
+                set_project_sequence(seq); st.rerun()
 
 
 # ##############################################################################
@@ -1646,7 +1781,7 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
     # TAB G2: GRN by Project Priority
     with tab_g2:
         st.subheader("Today's GRN Items \u2014 Ordered by Project Priority")
-        st.caption(f"GRN Date: {selected_date.strftime('%d-%b-%Y')} | Items received today mapped to projects in priority order")
+        st.caption(f"GRN Date: {selected_date.strftime('%d-%b-%Y')} | Components cascade to projects by priority. Remaining supply after each allocation can fulfill lower-priority projects")
 
         grn_by_proj = build_grn_by_project_sequence(df_oob_filtered, df_grn_today, project_sequence)
 
@@ -1668,7 +1803,7 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
             # Add comma-separated fulfillable work orders per (project, component)
             grn_delivered_items = df_grn_today[df_grn_today["GRN_Status"].str.contains("Deliver", case=False, na=False)]
             grn_qty_map_wo = grn_delivered_items.groupby("Item")["Qty"].sum().to_dict()
-            wo_map_grn, wo_proj_map_grn = get_fulfillable_wo_map(df_oob_filtered, project_sequence, grn_qty_map=grn_qty_map_wo)
+            wo_map_grn, wo_proj_map_grn, wo_proj_order_map_grn = get_fulfillable_wo_map(df_oob_filtered, project_sequence, grn_qty_map=grn_qty_map_wo)
             grn_by_proj_display["Fulfillable Work Orders"] = grn_by_proj_display.apply(
                 lambda r: wo_map_grn.get((r["Project Name"], r["Component Code"]), ""), axis=1
             )
@@ -1704,11 +1839,18 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
             if wo_proj_map_grn:
                 st.markdown("---")
                 st.subheader("\U0001F4CB Fulfillable Work Orders by Project")
-                st.caption("Work Orders that can be fulfilled (fully or partially) from today's GRN, sorted by Job Start Date.")
+                st.caption("Work Orders cascade by priority while GRN supply remains. Partial fulfillment included. Sorted by Job Start Date.")
+                wo_proj_norm = {normalize_project_key(k): v for k, v in wo_proj_map_grn.items()}
+                wo_proj_order_norm = {normalize_project_key(k): v for k, v in wo_proj_order_map_grn.items()}
                 proj_wo_rows = []
                 for proj_name in project_sequence["Project Name"].str.strip():
-                    if proj_name in wo_proj_map_grn:
-                        proj_wo_rows.append({"Project Name": proj_name, "Fulfillable Work Orders": wo_proj_map_grn[proj_name]})
+                    proj_key = normalize_project_key(proj_name)
+                    if proj_key in wo_proj_norm:
+                        proj_wo_rows.append({
+                            "Project Name": proj_name,
+                            "Fulfillable Work Orders": wo_proj_norm[proj_key],
+                            "Order Number": wo_proj_order_norm.get(proj_key, ""),
+                        })
                 if proj_wo_rows:
                     proj_wo_df = pd.DataFrame(proj_wo_rows)
                     proj_wo_df.insert(0, "Sr.", range(1, len(proj_wo_df) + 1))
@@ -1954,7 +2096,7 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
                     if idx > 0:
                         sr_current = seq.at[idx, "Sr."]; sr_above = seq.at[idx-1, "Sr."]
                         seq.at[idx, "Sr."] = sr_above; seq.at[idx-1, "Sr."] = sr_current
-                        st.session_state["project_sequence"] = seq.sort_values("Sr.").reset_index(drop=True)
+                        set_project_sequence(seq.sort_values("Sr.").reset_index(drop=True))
                         st.rerun()
         with col_ctrl3:
             if st.button("\u2b07\ufe0f Move Down", key="grn_down"):
@@ -1964,7 +2106,7 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
                     if idx < len(seq) - 1:
                         sr_current = seq.at[idx, "Sr."]; sr_below = seq.at[idx+1, "Sr."]
                         seq.at[idx, "Sr."] = sr_below; seq.at[idx+1, "Sr."] = sr_current
-                        st.session_state["project_sequence"] = seq.sort_values("Sr.").reset_index(drop=True)
+                        set_project_sequence(seq.sort_values("Sr.").reset_index(drop=True))
                         st.rerun()
         with col_ctrl4:
             if st.button("\u2705 Mark Complete", key="grn_complete"):
@@ -1972,14 +2114,14 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
                     seq = st.session_state["project_sequence"]
                     idx = seq[seq["Project Name"] == selected_project].index[0]
                     seq.at[idx, "Completed"] = True
-                    st.session_state["project_sequence"] = seq; st.rerun()
+                    set_project_sequence(seq); st.rerun()
         with col_ctrl5:
             if st.button("\u21a9\ufe0f Unmark", key="grn_unmark"):
                 if selected_project:
                     seq = st.session_state["project_sequence"]
                     idx = seq[seq["Project Name"] == selected_project].index[0]
                     seq.at[idx, "Completed"] = False
-                    st.session_state["project_sequence"] = seq; st.rerun()
+                    set_project_sequence(seq); st.rerun()
 
         st.markdown("---")
         edited_sequence = st.data_editor(
@@ -2003,20 +2145,22 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
                 else:
                     completed_items = st.session_state["project_sequence"][st.session_state["project_sequence"]["Completed"] == True]
                     updated = pd.concat([edited_sequence, completed_items], ignore_index=True).sort_values("Sr.").reset_index(drop=True)
-                st.session_state["project_sequence"] = updated; st.rerun()
+                set_project_sequence(updated); st.rerun()
         with col_btn2:
             if st.button("\U0001F504 Reset to Default", key="grn_reset"):
-                st.session_state["project_sequence"] = DEFAULT_PROJECT_SEQUENCE.copy(); st.rerun()
+                set_project_sequence(DEFAULT_PROJECT_SEQUENCE.copy()); st.rerun()
         with col_btn3:
             if st.button("\U0001F5D1\uFE0F Remove Completed", key="grn_remove"):
                 seq = st.session_state["project_sequence"]
                 seq = seq[seq["Completed"] == False].copy()
                 seq["Sr."] = range(1, len(seq) + 1)
-                st.session_state["project_sequence"] = seq; st.rerun()
+                set_project_sequence(seq); st.rerun()
 
-        seq_projects = set(project_sequence["Project Name"].str.strip())
-        oob_projects = set(df_oob_filtered["Project Name"].unique()) - {"nan"}
-        missing_from_seq = oob_projects - seq_projects
+        seq_projects = set(project_sequence["Project Name"].apply(normalize_project_key))
+        oob_projects = [p for p in df_oob_filtered["Project Name"].dropna().unique() if str(p) != "nan"]
+        oob_project_lookup = {normalize_project_key(p): p for p in oob_projects if normalize_project_key(p)}
+        missing_keys = set(oob_project_lookup.keys()) - seq_projects
+        missing_from_seq = sorted([oob_project_lookup[k] for k in missing_keys])
         if missing_from_seq:
             st.markdown("---")
             st.warning(f"**{len(missing_from_seq)} Orderbook project(s) not in priority sequence** (they will appear last in GRN view):")
@@ -2145,7 +2289,7 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
     # TAB 2: GRN by Project Priority (Combined)
     with tab2:
         st.subheader("Today's GRN Items \u2014 Ordered by Project Priority")
-        st.caption(f"GRN Date: {selected_date.strftime('%d-%b-%Y')} | Items received today mapped to projects in priority order")
+        st.caption(f"GRN Date: {selected_date.strftime('%d-%b-%Y')} | Components cascade to projects by priority. Remaining supply after each allocation can fulfill lower-priority projects")
 
         grn_by_proj = build_grn_by_project_sequence(
             df_oob_filtered, df_grn_today, project_sequence, stock_map
@@ -2169,7 +2313,7 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
             # Add comma-separated fulfillable work orders per (project, component)
             grn_delivered_items = df_grn_today[df_grn_today["GRN_Status"].str.contains("Deliver", case=False, na=False)]
             grn_qty_map_wo = grn_delivered_items.groupby("Item")["Qty"].sum().to_dict()
-            wo_map_combined, wo_proj_map_combined = get_fulfillable_wo_map(
+            wo_map_combined, wo_proj_map_combined, wo_proj_order_map_combined = get_fulfillable_wo_map(
                 df_oob_filtered, project_sequence, stock_map=stock_map, grn_qty_map=grn_qty_map_wo
             )
             grn_by_proj_display["Fulfillable Work Orders"] = grn_by_proj_display.apply(
@@ -2218,11 +2362,18 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
             if wo_proj_map_combined:
                 st.markdown("---")
                 st.subheader("\U0001F4CB Fulfillable Work Orders by Project")
-                st.caption("Work Orders that can be fulfilled (fully or partially) from stock + today's GRN combined, sorted by Job Start Date.")
+                st.caption("Work Orders cascade by priority while stock+GRN supply remains. Partial fulfillment included. Sorted by Job Start Date.")
+                wo_proj_norm = {normalize_project_key(k): v for k, v in wo_proj_map_combined.items()}
+                wo_proj_order_norm = {normalize_project_key(k): v for k, v in wo_proj_order_map_combined.items()}
                 proj_wo_rows = []
                 for proj_name in project_sequence["Project Name"].str.strip():
-                    if proj_name in wo_proj_map_combined:
-                        proj_wo_rows.append({"Project Name": proj_name, "Fulfillable Work Orders": wo_proj_map_combined[proj_name]})
+                    proj_key = normalize_project_key(proj_name)
+                    if proj_key in wo_proj_norm:
+                        proj_wo_rows.append({
+                            "Project Name": proj_name,
+                            "Fulfillable Work Orders": wo_proj_norm[proj_key],
+                            "Order Number": wo_proj_order_norm.get(proj_key, ""),
+                        })
                 if proj_wo_rows:
                     proj_wo_df = pd.DataFrame(proj_wo_rows)
                     proj_wo_df.insert(0, "Sr.", range(1, len(proj_wo_df) + 1))
@@ -2472,7 +2623,7 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
         st.caption(
             "Edit the project priority order below. Lower Sr. number = higher priority. "
             "This sequence determines the order in which GRN items are displayed in the "
-            "'GRN by Project Priority' tab. Changes persist during this session."
+            "'GRN by Project Priority' tab. Changes are autosaved and persist after relaunch."
         )
         render_sequence_upload_controls("combined")
 
@@ -2510,7 +2661,7 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
                         seq.at[idx, "Sr."] = sr_above
                         seq.at[idx-1, "Sr."] = sr_current
                         seq = seq.sort_values("Sr.").reset_index(drop=True)
-                        st.session_state["project_sequence"] = seq
+                        set_project_sequence(seq)
                         st.rerun()
 
         with col_ctrl3:
@@ -2524,7 +2675,7 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
                         seq.at[idx, "Sr."] = sr_below
                         seq.at[idx+1, "Sr."] = sr_current
                         seq = seq.sort_values("Sr.").reset_index(drop=True)
-                        st.session_state["project_sequence"] = seq
+                        set_project_sequence(seq)
                         st.rerun()
 
         with col_ctrl4:
@@ -2533,7 +2684,7 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
                     seq = st.session_state["project_sequence"]
                     idx = seq[seq["Project Name"] == selected_project].index[0]
                     seq.at[idx, "Completed"] = True
-                    st.session_state["project_sequence"] = seq
+                    set_project_sequence(seq)
                     st.success(f"Marked '{selected_project}' as completed!")
                     st.rerun()
 
@@ -2543,7 +2694,7 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
                     seq = st.session_state["project_sequence"]
                     idx = seq[seq["Project Name"] == selected_project].index[0]
                     seq.at[idx, "Completed"] = False
-                    st.session_state["project_sequence"] = seq
+                    set_project_sequence(seq)
                     st.success(f"Unmarked '{selected_project}'!")
                     st.rerun()
 
@@ -2574,13 +2725,13 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
                     completed_items = st.session_state["project_sequence"][st.session_state["project_sequence"]["Completed"] == True]
                     updated = pd.concat([edited_sequence, completed_items], ignore_index=True)
                     updated = updated.sort_values("Sr.").reset_index(drop=True)
-                st.session_state["project_sequence"] = updated
+                set_project_sequence(updated)
                 st.success("Priority sequence updated! Switch to 'GRN by Project Priority' tab to see the new order.")
                 st.rerun()
 
         with col_btn2:
             if st.button("\U0001F504 Reset to Default"):
-                st.session_state["project_sequence"] = DEFAULT_PROJECT_SEQUENCE.copy()
+                set_project_sequence(DEFAULT_PROJECT_SEQUENCE.copy())
                 st.success("Reset to default sequence!")
                 st.rerun()
 
@@ -2589,13 +2740,15 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
                 seq = st.session_state["project_sequence"]
                 seq = seq[seq["Completed"] == False].copy()
                 seq["Sr."] = range(1, len(seq) + 1)
-                st.session_state["project_sequence"] = seq
+                set_project_sequence(seq)
                 st.success("Removed all completed projects!")
                 st.rerun()
 
-        seq_projects = set(project_sequence["Project Name"].str.strip())
-        oob_projects = set(df_oob_filtered["Project Name"].unique()) - {"nan"}
-        missing_from_seq = oob_projects - seq_projects
+            seq_projects = set(project_sequence["Project Name"].apply(normalize_project_key))
+            oob_projects = [p for p in df_oob_filtered["Project Name"].dropna().unique() if str(p) != "nan"]
+            oob_project_lookup = {normalize_project_key(p): p for p in oob_projects if normalize_project_key(p)}
+            missing_keys = set(oob_project_lookup.keys()) - seq_projects
+            missing_from_seq = sorted([oob_project_lookup[k] for k in missing_keys])
         if missing_from_seq:
             st.markdown("---")
             st.warning(

@@ -10,6 +10,8 @@ import subprocess
 import webbrowser
 import time
 import socket
+from urllib.request import urlopen
+from urllib.error import URLError
 
 
 def get_free_port():
@@ -48,10 +50,27 @@ def main():
         "--global.developmentMode=false",
     ]
 
-    # Open browser after a short delay
+    # Open browser only after Streamlit is actually ready
     def open_browser():
-        time.sleep(3)
-        webbrowser.open(f"http://localhost:{port}")
+        health_url = f"http://localhost:{port}/_stcore/health"
+        app_url = f"http://localhost:{port}"
+        max_wait_seconds = 45
+        start = time.time()
+
+        while time.time() - start < max_wait_seconds:
+            try:
+                with urlopen(health_url, timeout=2) as resp:
+                    if resp.status == 200:
+                        webbrowser.open(app_url)
+                        return
+            except URLError:
+                pass
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        # Fallback: open anyway after timeout
+        webbrowser.open(app_url)
 
     import threading
     threading.Thread(target=open_browser, daemon=True).start()
