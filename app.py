@@ -706,7 +706,6 @@ def build_component_reconciliation(df_oob, df_grn_today, stock_map=None):
         "Quantity Issued": "sum",
         "Open Qty": "sum",
         "On Hand Quantity": "first",
-        "Total Available": "first",
         "Component Desc": "first",
     })
 
@@ -746,7 +745,7 @@ def build_project_summary(df_oob, df_grn_today, stock_map=None):
     }).rename(columns={
         "Component Code": "Unique Components",
         "Order Number": "Unique Orders",
-        "ITEM": "Unique Items (FG)",
+        "ITEM": "No of Cabinets",
         "Availability": "Components Available",
     })
 
@@ -771,13 +770,20 @@ def build_project_summary(df_oob, df_grn_today, stock_map=None):
     else:
         proj_components["Stock Qty"] = 0
 
+    # Calculate unique components issued per project
+    components_issued = df_oob[df_oob["Quantity Issued"] > 0].groupby(["Project Num", "Project Name"])["Component Code"].nunique().reset_index()
+    components_issued.columns = ["Project Num", "Project Name", "Components Issued"]
+    
     proj_summary = proj_agg.merge(
         proj_components[["Project Num", "Project Name", "Components Received Today", "Qty Received Today", "Stock Qty"]],
         on=["Project Num", "Project Name"], how="left"
     )
+    proj_summary = proj_summary.merge(components_issued, on=["Project Num", "Project Name"], how="left")
+    proj_summary["Components Issued"] = proj_summary["Components Issued"].fillna(0)
+    
     proj_summary["Fulfillment %"] = np.where(
-        proj_summary["Required Quantity"] > 0,
-        ((proj_summary["Quantity Issued"] / proj_summary["Required Quantity"]) * 100).round(1),
+        proj_summary["Unique Components"] > 0,
+        ((proj_summary["Components Issued"] / proj_summary["Unique Components"]) * 100).round(1),
         100
     )
     proj_summary = proj_summary.sort_values("Open Qty", ascending=False)
@@ -918,7 +924,7 @@ def build_project_summary_stock_only(df_oob, stock_map):
     }).rename(columns={
         "Component Code": "Unique Components",
         "Order Number": "Unique Orders",
-        "ITEM": "Unique Items (FG)",
+        "ITEM": "No of Cabinets",
         "Availability": "Components Available",
     })
 
@@ -936,13 +942,20 @@ def build_project_summary_stock_only(df_oob, stock_map):
         proj_components["Stock Qty"] = 0
         proj_components["Components In Stock"] = 0
 
+    # Calculate unique components issued per project
+    components_issued = df_oob[df_oob["Quantity Issued"] > 0].groupby(["Project Num", "Project Name"])["Component Code"].nunique().reset_index()
+    components_issued.columns = ["Project Num", "Project Name", "Components Issued"]
+    
     proj_summary = proj_agg.merge(
         proj_components[["Project Num", "Project Name", "Stock Qty", "Components In Stock"]],
         on=["Project Num", "Project Name"], how="left"
     )
+    proj_summary = proj_summary.merge(components_issued, on=["Project Num", "Project Name"], how="left")
+    proj_summary["Components Issued"] = proj_summary["Components Issued"].fillna(0)
+    
     proj_summary["Fulfillment %"] = np.where(
-        proj_summary["Required Quantity"] > 0,
-        ((proj_summary["Quantity Issued"] / proj_summary["Required Quantity"]) * 100).round(1),
+        proj_summary["Unique Components"] > 0,
+        ((proj_summary["Components Issued"] / proj_summary["Unique Components"]) * 100).round(1),
         100
     )
     proj_summary = proj_summary.sort_values("Open Qty", ascending=False)
@@ -995,7 +1008,7 @@ def build_project_summary_grn_only(df_oob, df_grn_today):
     }).rename(columns={
         "Component Code": "Unique Components",
         "Order Number": "Unique Orders",
-        "ITEM": "Unique Items (FG)",
+        "ITEM": "No of Cabinets",
         "Availability": "Components Available",
     })
 
@@ -1013,13 +1026,20 @@ def build_project_summary_grn_only(df_oob, df_grn_today):
         lambda s: sum(grn_qty_by_item.get(item, 0) for item in s & grn_items_today)
     )
 
+    # Calculate unique components issued per project
+    components_issued = df_oob[df_oob["Quantity Issued"] > 0].groupby(["Project Num", "Project Name"])["Component Code"].nunique().reset_index()
+    components_issued.columns = ["Project Num", "Project Name", "Components Issued"]
+    
     proj_summary = proj_agg.merge(
         proj_components[["Project Num", "Project Name", "Components Received Today", "Qty Received Today"]],
         on=["Project Num", "Project Name"], how="left"
     )
+    proj_summary = proj_summary.merge(components_issued, on=["Project Num", "Project Name"], how="left")
+    proj_summary["Components Issued"] = proj_summary["Components Issued"].fillna(0)
+    
     proj_summary["Fulfillment %"] = np.where(
-        proj_summary["Required Quantity"] > 0,
-        ((proj_summary["Quantity Issued"] / proj_summary["Required Quantity"]) * 100).round(1),
+        proj_summary["Unique Components"] > 0,
+        ((proj_summary["Components Issued"] / proj_summary["Unique Components"]) * 100).round(1),
         100
     )
     proj_summary = proj_summary.sort_values("Open Qty", ascending=False)
@@ -1033,7 +1053,6 @@ def build_component_reconciliation_grn_only(df_oob, df_grn_today):
         "Quantity Issued": "sum",
         "Open Qty": "sum",
         "On Hand Quantity": "first",
-        "Total Available": "first",
         "Component Desc": "first",
     })
     oob_agg["Stock Qty"] = oob_agg["On Hand Quantity"]
@@ -1360,9 +1379,6 @@ if analysis_mode == "\U0001F4E6 Stock Analysis" and not uploaded_stock:
 elif analysis_mode == "\U0001F4E5 GRN Analysis" and not uploaded_grn:
     st.info("\U0001F448 Upload the Daily Material Incoming file from the sidebar to use GRN Analysis mode.")
     st.stop()
-elif analysis_mode == "\U0001F4CB Supply Eligible Analysis" and not uploaded_stock:
-    st.info("\U0001F448 Upload the Stock file from the sidebar to use Supply Eligible Analysis mode.")
-    st.stop()
 elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)" and (not uploaded_grn or not uploaded_stock):
     missing = []
     if not uploaded_grn:
@@ -1533,7 +1549,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
         if stock_map.get(c, 0) == 0
     )
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.markdown(f'<div class="metric-card project"><h2>{total_projects}</h2><p>Active Projects</p></div>', unsafe_allow_html=True)
     with c2:
@@ -1544,8 +1560,6 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
         st.markdown(f'<div class="metric-card project"><h2>{partially_available}</h2><p>Partially Available</p></div>', unsafe_allow_html=True)
     with c5:
         st.markdown(f'<div class="metric-card shortage"><h2>{zero_availability}</h2><p>Shortage</p></div>', unsafe_allow_html=True)
-    with c6:
-        st.markdown(f'<div class="metric-card incoming"><h2>Component-Level</h2><p>Analysis Below</p></div>', unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -1566,8 +1580,8 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
         proj_summary = build_project_summary_stock_only(df_oob_filtered, stock_map)
 
         display_cols = [
-            "Project Num", "Project Name", "Unique Orders", "Unique Items (FG)",
-            "Unique Components", "Components Available", "Components In Stock",
+            "Project Num", "Project Name", "Unique Orders", "No of Cabinets",
+            "Unique Components", "Components In Stock",
             "Fulfillment %",
         ]
         available_cols = [c for c in display_cols if c in proj_summary.columns]
@@ -1603,10 +1617,6 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
                 "Required Quantity": "sum",
                 "Quantity Issued": "sum",
                 "Open Qty": "sum",
-                "On Hand Quantity": "first",
-                "Incoming PO Qty": "sum",
-                "Total Available": "first",
-                "Availability": "first",
                 "Supplier": "first",
             })
             proj_comp_detail["Stock Qty"] = proj_comp_detail["Component Code"].map(stock_map).fillna(0)
@@ -1984,28 +1994,41 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
 
     # -- KPI Cards (GRN mode) --------------------------------------------------
     grn_delivered_today = df_grn_today[df_grn_today["GRN_Status"].str.contains("Deliver", case=False, na=False)]
-    grn_rejected_today = df_grn_today[df_grn_today["GRN_Status"].str.contains("Reject", case=False, na=False)]
-
-    total_open_qty = df_oob_filtered["Open Qty"].sum()
-    total_received_today = grn_delivered_today["Qty"].sum()
-    total_unique_components = df_oob_filtered["Component Code"].nunique()
-    components_received_today = len(set(grn_delivered_today["Item"]) & set(df_oob_filtered["Component Code"]))
+    
+    # Filter to components with open qty in Production Open status
+    component_open_qty = df_oob_filtered.groupby("Component Code")["Open Qty"].sum()
+    components_with_open_qty = {c: qty for c, qty in component_open_qty.items() if qty > 0}
+    total_unique_components = len(components_with_open_qty)
     total_projects = df_oob_filtered[["Project Num", "Project Name"]].drop_duplicates().shape[0]
-    total_rejected_today = grn_rejected_today["Qty"].sum()
+    
+    # Calculate received quantities per component
+    grn_qty_map = grn_delivered_today.groupby("Item")["Qty"].sum().to_dict()
+    
+    # Calculate fulfillment breakdown for components with open qty
+    fully_fulfilled = sum(
+        1 for c, open_qty in components_with_open_qty.items() 
+        if grn_qty_map.get(c, 0) >= open_qty
+    )
+    partially_fulfilled = sum(
+        1 for c, open_qty in components_with_open_qty.items() 
+        if 0 < grn_qty_map.get(c, 0) < open_qty
+    )
+    not_received = sum(
+        1 for c, open_qty in components_with_open_qty.items() 
+        if grn_qty_map.get(c, 0) == 0
+    )
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        st.markdown(f'<div class="metric-card shortage"><h2>{total_open_qty:,.0f}</h2><p>Total Open Qty</p></div>', unsafe_allow_html=True)
-    with c2:
-        st.markdown(f'<div class="metric-card incoming"><h2>{total_received_today:,.0f}</h2><p>Received Today</p></div>', unsafe_allow_html=True)
-    with c3:
-        st.markdown(f'<div class="metric-card available"><h2>{components_received_today}</h2><p>Components Received (Matching)</p></div>', unsafe_allow_html=True)
-    with c4:
         st.markdown(f'<div class="metric-card project"><h2>{total_projects}</h2><p>Active Projects</p></div>', unsafe_allow_html=True)
-    with c5:
+    with c2:
         st.markdown(f'<div class="metric-card"><h2>{total_unique_components}</h2><p>Unique Components Needed</p></div>', unsafe_allow_html=True)
-    with c6:
-        st.markdown(f'<div class="metric-card shortage"><h2>{total_rejected_today:,.0f}</h2><p>Rejected Today</p></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="metric-card available"><h2>{fully_fulfilled}</h2><p>Fully Fulfilled</p></div>', unsafe_allow_html=True)
+    with c4:
+        st.markdown(f'<div class="metric-card project"><h2>{partially_fulfilled}</h2><p>Partially Fulfilled</p></div>', unsafe_allow_html=True)
+    with c5:
+        st.markdown(f'<div class="metric-card shortage"><h2>{not_received}</h2><p>Not Received</p></div>', unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -2026,8 +2049,8 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
         proj_summary = build_project_summary_grn_only(df_oob_filtered, df_grn_today)
 
         display_cols = [
-            "Project Num", "Project Name", "Unique Orders", "Unique Items (FG)",
-            "Unique Components", "Components Available", "Components Received Today",
+            "Project Num", "Project Name", "Unique Orders", "No of Cabinets",
+            "Unique Components", "Components Received Today",
             "Fulfillment %",
         ]
         available_cols = [c for c in display_cols if c in proj_summary.columns]
@@ -2067,10 +2090,6 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
                 "Required Quantity": "sum",
                 "Quantity Issued": "sum",
                 "Open Qty": "sum",
-                "On Hand Quantity": "first",
-                "Incoming PO Qty": "sum",
-                "Total Available": "first",
-                "Availability": "first",
                 "Supplier": "first",
             })
             proj_comp_detail["Received Today"] = proj_comp_detail["Component Code"].map(grn_qty_map).fillna(0)
@@ -2213,7 +2232,7 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
         recon_cols = [
             "Component Code", "Component Desc", "Required Quantity", "Quantity Issued",
             "Open Qty", "Stock Qty", "Received Today", "Still Pending",
-            "Total Available", "Supplier", "Status", "Availability Status"
+            "Supplier", "Status", "Availability Status"
         ]
         available_recon_cols = [c for c in recon_cols if c in recon_display.columns]
         display_dataframe_arrow_safe(
@@ -2480,28 +2499,42 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
 
     # -- KPI Cards (Combined) -------------------------------------------------
     grn_delivered_today = df_grn_today[df_grn_today["GRN_Status"].str.contains("Deliver", case=False, na=False)]
-    grn_rejected_today = df_grn_today[df_grn_today["GRN_Status"].str.contains("Reject", case=False, na=False)]
-
-    total_open_qty = df_oob_filtered["Open Qty"].sum()
-    total_received_today = grn_delivered_today["Qty"].sum()
-    total_unique_components_needed = df_oob_filtered["Component Code"].nunique()
-    components_received_today = len(set(grn_delivered_today["Item"]) & set(df_oob_filtered["Component Code"]))
+    
+    # Filter to components with open qty in Production Open status
+    component_open_qty = df_oob_filtered.groupby("Component Code")["Open Qty"].sum()
+    components_with_open_qty = {c: qty for c, qty in component_open_qty.items() if qty > 0}
+    total_unique_components = len(components_with_open_qty)
     total_projects = df_oob_filtered[["Project Num", "Project Name"]].drop_duplicates().shape[0]
-    total_rejected_today = grn_rejected_today["Qty"].sum()
+    
+    # Calculate received quantities per component
+    grn_qty_map = grn_delivered_today.groupby("Item")["Qty"].sum().to_dict()
+    
+    # Calculate fulfillment breakdown considering both stock and GRN
+    # Available: Stock + GRN >= Open Qty
+    fully_available = sum(
+        1 for c, open_qty in components_with_open_qty.items() 
+        if (stock_map.get(c, 0) + grn_qty_map.get(c, 0)) >= open_qty
+    )
+    partially_available = sum(
+        1 for c, open_qty in components_with_open_qty.items() 
+        if 0 < (stock_map.get(c, 0) + grn_qty_map.get(c, 0)) < open_qty
+    )
+    not_available = sum(
+        1 for c, open_qty in components_with_open_qty.items() 
+        if (stock_map.get(c, 0) + grn_qty_map.get(c, 0)) == 0
+    )
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        st.markdown(f'<div class="metric-card shortage"><h2>{total_open_qty:,.0f}</h2><p>Total Open Qty</p></div>', unsafe_allow_html=True)
-    with c2:
-        st.markdown(f'<div class="metric-card incoming"><h2>{total_received_today:,.0f}</h2><p>Received Today</p></div>', unsafe_allow_html=True)
-    with c3:
-        st.markdown(f'<div class="metric-card available"><h2>{components_received_today}</h2><p>Components Received (Matching)</p></div>', unsafe_allow_html=True)
-    with c4:
         st.markdown(f'<div class="metric-card project"><h2>{total_projects}</h2><p>Active Projects</p></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown(f'<div class="metric-card"><h2>{total_unique_components}</h2><p>Unique Components Needed</p></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="metric-card available"><h2>{fully_available}</h2><p>Fully Available</p></div>', unsafe_allow_html=True)
+    with c4:
+        st.markdown(f'<div class="metric-card project"><h2>{partially_available}</h2><p>Partially Available</p></div>', unsafe_allow_html=True)
     with c5:
-        st.markdown(f'<div class="metric-card"><h2>{total_unique_components_needed}</h2><p>Unique Components Needed</p></div>', unsafe_allow_html=True)
-    with c6:
-        st.markdown(f'<div class="metric-card shortage"><h2>{total_rejected_today:,.0f}</h2><p>Rejected Today</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card shortage"><h2>{not_available}</h2><p>Not Available</p></div>', unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -2522,8 +2555,8 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
         proj_summary = build_project_summary(df_oob_filtered, df_grn_today, stock_map)
 
         display_cols = [
-            "Project Num", "Project Name", "Unique Orders", "Unique Items (FG)",
-            "Unique Components", "Components Available", "Components Received Today",
+            "Project Num", "Project Name", "Unique Orders", "No of Cabinets",
+            "Unique Components", "Components Received Today",
             "Fulfillment %",
         ]
         proj_display = proj_summary[display_cols].copy()
@@ -2562,10 +2595,6 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
                 "Required Quantity": "sum",
                 "Quantity Issued": "sum",
                 "Open Qty": "sum",
-                "On Hand Quantity": "first",
-                "Incoming PO Qty": "sum",
-                "Total Available": "first",
-                "Availability": "first",
                 "Supplier": "first",
             })
 
@@ -2726,7 +2755,7 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
         recon_cols = [
             "Component Code", "Component Desc", "Required Quantity", "Quantity Issued",
             "Open Qty", "Stock Qty", "Received Today", "Still Pending",
-            "Total Available", "Supplier", "Status", "Availability Status"
+            "Supplier", "Status", "Availability Status"
         ]
         available_recon_cols = [c for c in recon_cols if c in recon_display.columns]
 
@@ -3063,24 +3092,40 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
         so_data = df_oob_supply_open_filtered.copy()
 
         # -- KPI Cards (Supply Eligible) -------------------------------------------
-        so_total_projects = so_data["Project Name"].nunique()
-        so_total_components = so_data["Component Code"].nunique()
-        so_comp_in_stock = sum(1 for c in so_data["Component Code"].unique() if stock_map.get(c, 0) > 0)
-        so_overall_comp_pct = (so_comp_in_stock / so_total_components * 100) if so_total_components > 0 else 100.0
+        # Build on-hand quantity map from the orderbook data itself
+        on_hand_map = so_data.groupby("Component Code")["On Hand Quantity"].first().to_dict()
+        
+        # Filter to components with open qty in Supply Eligible status
+        component_open_qty = so_data.groupby("Component Code")["Open Qty"].sum()
+        components_with_open_qty = {c: qty for c, qty in component_open_qty.items() if qty > 0}
+        total_unique_components = len(components_with_open_qty)
+        total_projects = so_data[["Project Num", "Project Name"]].drop_duplicates().shape[0]
+        
+        # Calculate availability breakdown for components with open qty
+        fully_available = sum(
+            1 for c, open_qty in components_with_open_qty.items() 
+            if on_hand_map.get(c, 0) >= open_qty
+        )
+        partially_available = sum(
+            1 for c, open_qty in components_with_open_qty.items() 
+            if 0 < on_hand_map.get(c, 0) < open_qty
+        )
+        zero_availability = sum(
+            1 for c, open_qty in components_with_open_qty.items() 
+            if on_hand_map.get(c, 0) == 0
+        )
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
-            st.markdown(f'<div class="metric-card project"><h2>{so_total_projects}</h2><p>Supply Eligible Projects</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card project"><h2>{total_projects}</h2><p>Supply Eligible Projects</p></div>', unsafe_allow_html=True)
         with c2:
-            st.markdown(f'<div class="metric-card"><h2>{so_total_components}</h2><p>Unique Components</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><h2>{total_unique_components}</h2><p>Unique Components Needed</p></div>', unsafe_allow_html=True)
         with c3:
-            st.markdown(f'<div class="metric-card incoming"><h2>{so_comp_in_stock}/{so_total_components}</h2><p>Components Available</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card available"><h2>{fully_available}</h2><p>Fully Available</p></div>', unsafe_allow_html=True)
         with c4:
-            st.markdown(f'<div class="metric-card available"><h2>{so_overall_comp_pct:.1f}%</h2><p>Fulfillment Capacity</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card project"><h2>{partially_available}</h2><p>Partially Available</p></div>', unsafe_allow_html=True)
         with c5:
-            st.markdown(f'<div class="metric-card incoming"><h2>Component-Level</h2><p>Analytics Below</p></div>', unsafe_allow_html=True)
-        with c6:
-            st.markdown(f'<div class="metric-card incoming"><h2>No Qty View</h2><p>At Project Scale</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card shortage"><h2>{zero_availability}</h2><p>Shortage</p></div>', unsafe_allow_html=True)
 
         st.markdown("---")
 
@@ -3112,35 +3157,35 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
                 "Order Number": "Unique Orders",
             })
 
+            # Calculate component-level open qty for each project
+            so_comp_open = so_df.groupby(["Project Num", "Project Name", "Component Code"])["Open Qty"].sum().reset_index()
+            so_comp_open["Stock Qty"] = so_comp_open["Component Code"].map(on_hand_map).fillna(0)
+            so_comp_open["Is Fully Available"] = so_comp_open["Stock Qty"] >= so_comp_open["Open Qty"]
+            
+            # Count fully available components per project
+            fully_available_by_proj = so_comp_open.groupby(["Project Num", "Project Name"])["Is Fully Available"].sum().reset_index()
+            fully_available_by_proj.columns = ["Project Num", "Project Name", "Fully Available Components"]
+            
             so_proj_comp = so_df.groupby(["Project Num", "Project Name"])["Component Code"].apply(set).reset_index()
             so_proj_comp.columns = ["Project Num", "Project Name", "Component Set"]
             so_proj_comp["Stock Qty"] = so_proj_comp["Component Set"].apply(
-                lambda s: sum(stock_map.get(c, 0) for c in s)
+                lambda s: sum(on_hand_map.get(c, 0) for c in s)
             )
-            so_proj_comp["Components In Stock"] = so_proj_comp["Component Set"].apply(
-                lambda s: sum(1 for c in s if stock_map.get(c, 0) > 0)
-            )
+            
             so_proj = so_proj.merge(
-                so_proj_comp[["Project Num", "Project Name", "Stock Qty", "Components In Stock"]],
+                so_proj_comp[["Project Num", "Project Name", "Stock Qty"]],
                 on=["Project Num", "Project Name"], how="left"
             )
-            so_proj["Qty Fulfillment %"] = np.where(
-                so_proj["Open Qty"] > 0,
-                ((so_proj["Stock Qty"] / so_proj["Open Qty"]).clip(upper=1) * 100).round(1),
-                100.0
+            so_proj = so_proj.merge(
+                fully_available_by_proj,
+                on=["Project Num", "Project Name"], how="left"
             )
             so_proj["Component Fulfillment %"] = np.where(
                 so_proj["Unique Components"] > 0,
-                ((so_proj["Components In Stock"] / so_proj["Unique Components"]) * 100).round(1),
+                ((so_proj["Fully Available Components"] / so_proj["Unique Components"]) * 100).round(1),
                 100.0
             )
             so_proj = so_proj.sort_values("Open Qty", ascending=False).reset_index(drop=True)
-
-            # --- Add component ratio column for display ---
-            so_proj["Component Ratio"] = (
-                so_proj["Components In Stock"].astype(int).astype(str) + "/" +
-                so_proj["Unique Components"].astype(int).astype(str)
-            )
             
             # --- Project-wise table -------------------------------------------
             st.markdown("##### Project-wise Supply Eligible Fulfillment")
@@ -3148,7 +3193,7 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
             so_display.insert(0, "Sr.", range(1, len(so_display) + 1))
             so_display_cols = [
                 "Sr.", "Project Num", "Project Name", "Unique Orders",
-                "Unique Components", "Component Ratio", "Components In Stock",
+                "Unique Components", "Fully Available Components",
                 "Component Fulfillment %",
             ]
             avail_cols = [c for c in so_display_cols if c in so_display.columns]
@@ -3190,41 +3235,45 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
                 "Open Qty": "sum",
             }).rename(columns={"Component Code": "Unique Components"})
 
+            # Calculate component-level open qty for each project (analytics)
+            so_comp_open_a = so_df_a.groupby(["Project Num", "Project Name", "Component Code"])["Open Qty"].sum().reset_index()
+            so_comp_open_a["Stock Qty"] = so_comp_open_a["Component Code"].map(on_hand_map).fillna(0)
+            so_comp_open_a["Is Fully Available"] = so_comp_open_a["Stock Qty"] >= so_comp_open_a["Open Qty"]
+            
+            # Count fully available components per project (analytics)
+            fully_available_by_proj_a = so_comp_open_a.groupby(["Project Num", "Project Name"])["Is Fully Available"].sum().reset_index()
+            fully_available_by_proj_a.columns = ["Project Num", "Project Name", "Fully Available Components"]
+            
             so_proj_comp_a = so_df_a.groupby(["Project Num", "Project Name"])["Component Code"].apply(set).reset_index()
             so_proj_comp_a.columns = ["Project Num", "Project Name", "Component Set"]
             so_proj_comp_a["Stock Qty"] = so_proj_comp_a["Component Set"].apply(
-                lambda s: sum(stock_map.get(c, 0) for c in s)
-            )
-            so_proj_comp_a["Components In Stock"] = so_proj_comp_a["Component Set"].apply(
-                lambda s: sum(1 for c in s if stock_map.get(c, 0) > 0)
+                lambda s: sum(on_hand_map.get(c, 0) for c in s)
             )
             so_proj_a = so_proj_a.merge(
-                so_proj_comp_a[["Project Num", "Project Name", "Stock Qty", "Components In Stock"]],
+                so_proj_comp_a[["Project Num", "Project Name", "Stock Qty"]],
                 on=["Project Num", "Project Name"], how="left"
             )
-            so_proj_a["Qty Fulfillment %"] = np.where(
-                so_proj_a["Open Qty"] > 0,
-                ((so_proj_a["Stock Qty"] / so_proj_a["Open Qty"]).clip(upper=1) * 100).round(1),
-                100.0
+            so_proj_a = so_proj_a.merge(
+                fully_available_by_proj_a,
+                on=["Project Num", "Project Name"], how="left"
             )
             so_proj_a["Component Fulfillment %"] = np.where(
                 so_proj_a["Unique Components"] > 0,
-                ((so_proj_a["Components In Stock"] / so_proj_a["Unique Components"]) * 100).round(1),
+                ((so_proj_a["Fully Available Components"] / so_proj_a["Unique Components"]) * 100).round(1),
                 100.0
             )
-            so_proj_a["Open Components"] = so_proj_a["Unique Components"] - so_proj_a["Components In Stock"]
+            so_proj_a["Open Components"] = so_proj_a["Unique Components"] - so_proj_a["Fully Available Components"]
             so_proj_a["Component Ratio"] = (
-                so_proj_a["Components In Stock"].astype(int).astype(str) + "/" +
+                so_proj_a["Fully Available Components"].astype(int).astype(str) + "/" +
                 so_proj_a["Unique Components"].astype(int).astype(str)
             )
             so_proj_a["Open/Total Label"] = so_proj_a["Component Ratio"]
 
             # --- Filters & Sort -----------------------------------------------
             st.markdown("##### \U0001F50D Filters & Sorting")
-            fc1, fc2, fc3 = st.columns(3)
+            fc1, fc2 = st.columns(2)
             with fc1:
                 sort_opt_so = st.selectbox("Sort by:", [
-                    "Qty Fulfillment % (asc)", "Qty Fulfillment % (desc)",
                     "Component Fulfillment % (asc)", "Component Fulfillment % (desc)",
                     "Open Qty (desc)", "Open Qty (asc)",
                     "Project Name (A-Z)",
@@ -3235,27 +3284,19 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
                     "Filter by Project:", options=all_so_projects, default=[],
                     key="so_analytics_proj_filter", placeholder="All projects shown"
                 )
-            with fc3:
-                so_range = st.slider("Qty Fulfillment % range:", 0, 100, (0, 100), key="so_fulfill_range")
 
             so_filtered = so_proj_a.copy()
             if sel_so_proj:
                 so_filtered = so_filtered[so_filtered["Project Name"].isin(sel_so_proj)]
-            so_filtered = so_filtered[
-                (so_filtered["Qty Fulfillment %"] >= so_range[0]) &
-                (so_filtered["Qty Fulfillment %"] <= so_range[1])
-            ]
 
             sort_map_so = {
-                "Qty Fulfillment % (asc)": ("Qty Fulfillment %", True),
-                "Qty Fulfillment % (desc)": ("Qty Fulfillment %", False),
                 "Component Fulfillment % (asc)": ("Component Fulfillment %", True),
                 "Component Fulfillment % (desc)": ("Component Fulfillment %", False),
                 "Open Qty (desc)": ("Open Qty", False),
                 "Open Qty (asc)": ("Open Qty", True),
                 "Project Name (A-Z)": ("Project Name", True),
             }
-            s_col, s_asc = sort_map_so.get(sort_opt_so, ("Qty Fulfillment %", True))
+            s_col, s_asc = sort_map_so.get(sort_opt_so, ("Component Fulfillment %", True))
             so_filtered = so_filtered.sort_values(s_col, ascending=s_asc)
 
             st.caption(f"Showing {len(so_filtered)} of {len(so_proj_a)} Supply Eligible projects")
@@ -3263,32 +3304,19 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
             chart_h = max(400, len(so_filtered) * 28 + 100)
 
             # --- Charts -------------------------------------------------------
-            col_a, col_b = st.columns(2)
-            with col_a:
-                fig_so1 = px.bar(
-                    so_filtered, x="Qty Fulfillment %", y="Project Name", orientation="h",
-                    title="Qty Fulfillment % by Project (Stock vs Open Qty)",
-                    color="Qty Fulfillment %", color_continuous_scale="RdYlGn",
-                    text=so_filtered["Qty Fulfillment %"].apply(lambda x: f"{x:.1f}%"),
-                )
-                fig_so1.update_traces(textposition="outside")
-                fig_so1.update_layout(yaxis=dict(autorange="reversed"), height=chart_h)
-                st.plotly_chart(fig_so1, use_container_width=True)
-
-            with col_b:
-                fig_so2 = px.bar(
+            fig_so2 = px.bar(
                     so_filtered, x="Component Fulfillment %", y="Project Name", orientation="h",
                     title="Component Coverage % (Available / Total Components)",
                     color="Component Fulfillment %", color_continuous_scale="RdYlGn",
                     text="Component Ratio",
                     custom_data=["Component Ratio"],
                 )
-                fig_so2.update_traces(
-                    textposition="outside",
-                    hovertemplate="<b>%{y}</b><br>Component Coverage: %{x:.1f}%<br>Available: %{customdata[0]}<extra></extra>"
-                )
-                fig_so2.update_layout(yaxis=dict(autorange="reversed"), height=chart_h)
-                st.plotly_chart(fig_so2, use_container_width=True)
+            fig_so2.update_traces(
+                textposition="outside",
+                hovertemplate="<b>%{y}</b><br>Component Coverage: %{x:.1f}%<br>Available: %{customdata[0]}<extra></extra>"
+            )
+            fig_so2.update_layout(yaxis=dict(autorange="reversed"), height=chart_h)
+            st.plotly_chart(fig_so2, use_container_width=True)
 
             st.markdown("---")
             st.info("💡 Quantity-wise analytics (Open Qty, Stock Qty) are shown only at **component level** in the Project Search tab for detailed insights.")
@@ -3298,7 +3326,7 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
             st.subheader("Supply Eligible Analytics Table")
             so_tbl = so_filtered[[
                 "Project Name", "Unique Components", "Component Ratio",
-                "Components In Stock", "Open Components",
+                "Fully Available Components", "Open Components",
                 "Component Fulfillment %"
             ]].reset_index(drop=True)
             so_tbl.index = so_tbl.index + 1
@@ -3337,7 +3365,7 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
                     "Quantity Issued": "sum",
                     "Open Qty": "sum",
                 })
-                comp_detail["Stock Qty"] = comp_detail["Component Code"].map(stock_map).fillna(0)
+                comp_detail["Stock Qty"] = comp_detail["Component Code"].map(on_hand_map).fillna(0)
                 comp_detail["Surplus / Deficit"] = comp_detail["Stock Qty"] - comp_detail["Open Qty"]
                 comp_detail["Fulfillable Qty"] = comp_detail[["Stock Qty", "Open Qty"]].min(axis=1)
                 comp_detail["Fulfillment %"] = np.where(
@@ -3360,7 +3388,6 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
                 total_open = comp_detail["Open Qty"].sum()
                 total_stock = comp_detail["Stock Qty"].sum()
                 total_fulfillable = comp_detail["Fulfillable Qty"].sum()
-                proj_qty_pct = (total_fulfillable / total_open * 100) if total_open > 0 else 100.0
                 proj_comp_pct = (fully_avail / total_comp * 100) if total_comp > 0 else 100.0
 
                 pk1, pk2, pk3, pk4 = st.columns(4)
@@ -3369,10 +3396,9 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
                 pk3.metric("Partial", partial)
                 pk4.metric("Not Available", not_avail)
 
-                pk5, pk6, pk7 = st.columns(3)
+                pk5, pk6 = st.columns(2)
                 pk5.metric("Total Open Qty", f"{total_open:,.0f}")
                 pk6.metric("Fulfillable Qty", f"{total_fulfillable:,.0f}")
-                pk7.metric("Qty Fulfillment %", f"{proj_qty_pct:.1f}%")
 
                 st.markdown("---")
 
