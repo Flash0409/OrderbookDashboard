@@ -1,0 +1,32 @@
+{
+  "ob": [
+    {
+      "name": "Nashik iCenter Orderbook_NSK_Feb 242026.xlsm",
+      "type": "ob",
+      "hash": "1d1145939e6de409d812109169c146632584591115d4f40069e93d4206be9809",
+      "cached_path": "C:\\Users\\E1547548\\Desktop\\OrderbookDashboard\\.file_cache\\ob_1d1145939e6d.bin",
+      "upload_time": "2026-03-05T13:38:27.348121",
+      "size_bytes": 66978937
+    }
+  ],
+  "stock": [
+    {
+      "name": "Stock.xlsx",
+      "type": "stock",
+      "hash": "54256658006f697eb627fd5ae13765f57d2c6b1d76700ec2c5fe8784a32e36f6",
+      "cached_path": "C:\\Users\\E1547548\\Desktop\\OrderbookDashboard\\.file_cache\\stock_54256658006f.bin",
+      "upload_time": "2026-03-05T13:39:56.282540",
+      "size_bytes": 389423
+    }
+  ],
+  "grn": [
+    {
+      "name": "Daily Material Incoming.xlsx",
+      "type": "grn",
+      "hash": "d5c2ba29c9fb168cfaec85b75ebbe2f503948fa3c3862c7cccb87d1d030856a0",
+      "cached_path": "C:\\Users\\E1547548\\Desktop\\OrderbookDashboard\\.file_cache\\grn_d5c2ba29c9fb.bin",
+      "upload_time": "2026-03-05T13:49:09.284106",
+      "size_bytes": 22752431
+    }
+  ]
+}

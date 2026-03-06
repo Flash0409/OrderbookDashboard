@@ -13,6 +13,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, date
 from pathlib import Path
+import json
+import hashlib
+import shutil
+import io
 
 # -- Page config ---------------------------------------------------------------
 st.set_page_config(
@@ -39,6 +43,148 @@ st.markdown("""
     div[data-testid="stMetric"] { background: #f8f9fa; padding: 12px; border-radius: 8px; border: 1px solid #e9ecef; }
 </style>
 """, unsafe_allow_html=True)
+
+# -- Session State Initialization for File Caching ---------------------------
+if "uploaded_ob_file" not in st.session_state:
+    st.session_state.uploaded_ob_file = None
+    st.session_state.uploaded_ob_name = None
+    st.session_state.uploaded_ob_time = None
+    st.session_state.df_oob_cache = None
+    st.session_state.ob_sheets_cache = None
+
+if "uploaded_stock_file" not in st.session_state:
+    st.session_state.uploaded_stock_file = None
+    st.session_state.uploaded_stock_name = None
+    st.session_state.uploaded_stock_time = None
+    st.session_state.df_stock_cache = None
+
+if "uploaded_grn_file" not in st.session_state:
+    st.session_state.uploaded_grn_file = None
+    st.session_state.uploaded_grn_name = None
+    st.session_state.uploaded_grn_time = None
+    st.session_state.df_grn_cache = None
+    st.session_state.grn_sheets_cache = None
+
+
+# ==============================================================================
+#  PERSISTENT FILE CACHE MANAGEMENT
+# ==============================================================================
+
+# Setup file cache directory
+CACHE_DIR = Path(__file__).parent / ".file_cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+HISTORY_FILE = CACHE_DIR / "upload_history.json"
+
+
+def compute_file_hash(file_obj, chunk_size=8192):
+    """Compute SHA256 hash of uploaded file."""
+    hasher = hashlib.sha256()
+    while True:
+        chunk = file_obj.read(chunk_size)
+        if not chunk:
+            break
+        hasher.update(chunk)
+    file_obj.seek(0)  # Reset file pointer
+    return hasher.hexdigest()
+
+
+def load_file_history():
+    """Load file upload history from disk."""
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+
+def save_file_history(history):
+    """Save file upload history to disk."""
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        print(f"Error saving history: {e}")
+
+
+def cache_uploaded_file(file_obj, file_type):
+    """
+    Cache an uploaded file to disk.
+    Returns: (file_path, file_hash, file_metadata_dict)
+    """
+    file_hash = compute_file_hash(file_obj)
+    cached_path = CACHE_DIR / f"{file_type}_{file_hash[:12]}.bin"
+    
+    # Save file to cache
+    with open(cached_path, "wb") as f:
+        f.write(file_obj.getvalue() if hasattr(file_obj, 'getvalue') else file_obj.read())
+    
+    metadata = {
+        "name": file_obj.name,
+        "type": file_type,
+        "hash": file_hash,
+        "cached_path": str(cached_path),
+        "upload_time": datetime.now().isoformat(),
+        "size_bytes": cached_path.stat().st_size,
+    }
+    
+    return cached_path, file_hash, metadata
+
+
+def load_cached_file(cached_path):
+    """Load a cached file from disk and return as BytesIO."""
+    if Path(cached_path).exists():
+        with open(cached_path, "rb") as f:
+            return io.BytesIO(f.read())
+    return None
+
+
+def get_file_history_for_type(file_type):
+    """Get upload history for a specific file type."""
+    history = load_file_history()
+    return history.get(file_type, [])
+
+
+def add_to_file_history(file_type, metadata):
+    """Add or update file in upload history."""
+    history = load_file_history()
+    if file_type not in history:
+        history[file_type] = []
+    
+    # Check if this hash already exists
+    existing = [f for f in history[file_type] if f["hash"] == metadata["hash"]]
+    if not existing:
+        history[file_type].insert(0, metadata)  # Insert at beginning (most recent first)
+        # Keep only last 10 uploads per type
+        if len(history[file_type]) > 10:
+            history[file_type] = history[file_type][:10]
+    
+    save_file_history(history)
+
+
+def cleanup_orphaned_cache():
+    """Remove cached files that are no longer referenced in history."""
+    history = load_file_history()
+    referenced_paths = set()
+    
+    for file_type, files in history.items():
+        for file_meta in files:
+            referenced_paths.add(file_meta.get("cached_path"))
+    
+    # Remove unreferenced cache files
+    if CACHE_DIR.exists():
+        for cache_file in CACHE_DIR.glob("*.bin"):
+            if str(cache_file) not in referenced_paths:
+                try:
+                    cache_file.unlink()
+                except:
+                    pass
+
+
+# Run cleanup on app start
+cleanup_orphaned_cache()
 
 
 # ==============================================================================
@@ -100,9 +246,9 @@ SEQUENCE_STATE_FILE = Path(__file__).with_name("project_sequence_state.json")
 # ==============================================================================
 
 @st.cache_data
-def load_orderbook(file):
+def load_orderbook(file_bytes):
     """Load Orderbook data by detecting the sheet via required columns."""
-    xl = pd.ExcelFile(file, engine="openpyxl")
+    xl = pd.ExcelFile(file_bytes, engine="openpyxl")
     sheets = xl.sheet_names
 
     required_cols = {
@@ -165,9 +311,9 @@ def load_orderbook(file):
 
 
 @st.cache_data
-def load_grn(file):
+def load_grn(file_bytes):
     """Load GRN data by detecting the sheet via required columns."""
-    xl = pd.ExcelFile(file, engine="openpyxl")
+    xl = pd.ExcelFile(file_bytes, engine="openpyxl")
     sheets = xl.sheet_names
 
     required_cols = {"Item", "Qty", "Date"}
@@ -225,9 +371,9 @@ def load_grn(file):
 
 
 @st.cache_data
-def load_stock(file):
+def load_stock(file_bytes):
     """Load Stock data by detecting the sheet/header via required columns."""
-    xl = pd.ExcelFile(file, engine="openpyxl")
+    xl = pd.ExcelFile(file_bytes, engine="openpyxl")
     sheets = xl.sheet_names
 
     required_cols = {"Item Number", "On Hand Quantity"}
@@ -823,8 +969,16 @@ def build_component_stock_analysis(df_oob, stock_map):
     oob_agg["Availability Status"] = np.where(
         oob_agg["Stock Qty"] >= oob_agg["Open Qty"],
         "\u2705 Surplus / Available",
-        "\u274C Shortage"
+        np.where(
+            (oob_agg["Stock Qty"] > 0) & (oob_agg["Stock Qty"] < oob_agg["Open Qty"]),
+            "\U0001F536 Partially Available",
+            "\u274C Shortage"
+        )
     )
+    
+    # Filter to only components with open quantities (required comparison)
+    oob_agg = oob_agg[oob_agg["Open Qty"] > 0].copy()
+    
     return oob_agg
 
 
@@ -1011,17 +1165,126 @@ def get_fulfillable_wo_map(df_oob, project_sequence, stock_map=None, grn_qty_map
 
 
 # ==============================================================================
-#  SIDEBAR -- FILE UPLOAD & MODE SELECTION
+#  FILE CACHING HELPERS
 # ==============================================================================
+
+def handle_cached_file_upload(file_key, file_label, file_type, help_text=""):
+    """
+    Smart file uploader with persistent history across app restarts.
+    Shows cached file (session) and history from previous sessions.
+    Returns: (file_object, is_newly_uploaded)
+    """
+    cache_key = f"uploaded_{file_key}_file"
+    cache_name_key = f"uploaded_{file_key}_name"
+    cache_time_key = f"uploaded_{file_key}_time"
+    
+    st.sidebar.markdown("---")
+    
+    # Check session cache (current session)
+    has_session_cache = st.session_state.get(cache_key) is not None
+    session_cached_name = st.session_state.get(cache_name_key, "Unknown")
+    
+    # Show current file status if in session cache
+    if has_session_cache:
+        st.sidebar.success(
+            f"✅ **{file_label}** active: *{session_cached_name}*"
+        )
+        
+        col1, col2, col3 = st.sidebar.columns([1, 2, 1])
+        with col2:
+            clear_cache = st.button(
+                "🔄 Clear",
+                key=f"clear_{file_key}",
+                help="Clear cached file",
+                use_container_width=True
+            )
+        
+        if clear_cache:
+            st.session_state[cache_key] = None
+            st.session_state[cache_name_key] = None
+            st.session_state[cache_time_key] = None
+            st.rerun()
+    else:
+        # Show file history from previous sessions
+        history = get_file_history_for_type(file_key)
+        
+        if history:
+            st.sidebar.write(f"📋 **Recent {file_label} uploads:**")
+            with st.sidebar.expander("View history", expanded=False):
+                for i, file_meta in enumerate(history[:5], 1):
+                    upload_time = file_meta.get("upload_time", "Unknown")
+                    file_name = file_meta.get("name", "Unknown")
+                    
+                    # Parse ISO time for display
+                    try:
+                        dt = datetime.fromisoformat(upload_time)
+                        time_str = dt.strftime("%b %d, %H:%M")
+                    except:
+                        time_str = upload_time
+                    
+                    col_a, col_b = st.sidebar.columns([3, 1])
+                    with col_a:
+                        st.caption(f"{i}. {file_name}\n   *{time_str}*")
+                    with col_b:
+                        if st.button(
+                            "📂",
+                            key=f"use_history_{file_key}_{i}",
+                            help=f"Reuse this file",
+                            use_container_width=True
+                        ):
+                            # Load cached file
+                            cached_path = file_meta.get("cached_path")
+                            cached_file = load_cached_file(cached_path)
+                            if cached_file:
+                                # Create a file-like object with name attribute
+                                cached_file.name = file_meta.get("name", "cached_file")
+                                st.session_state[cache_key] = cached_file
+                                st.session_state[cache_name_key] = file_meta.get("name")
+                                st.session_state[cache_time_key] = time_str
+                                st.success(f"✅ Loaded: {file_meta.get('name')}")
+                                st.rerun()
+                            else:
+                                st.error("❌ Cached file not found")
+    
+    # File uploader
+    st.sidebar.write("")  # Spacing
+    uploaded_file = st.sidebar.file_uploader(
+        file_label if not has_session_cache else "📤 Upload new file",
+        type=file_type,
+        key=f"uploader_{file_key}",
+        help=help_text or f"Upload {file_label}"
+    )
+    
+    # Handle new upload
+    if uploaded_file is not None:
+        # Cache the file persistently
+        try:
+            cached_path, file_hash, metadata = cache_uploaded_file(uploaded_file, file_key)
+            add_to_file_history(file_key, metadata)
+        except Exception as e:
+            st.warning(f"⚠️ Could not cache file: {e}")
+        
+        # Also cache in session
+        st.session_state[cache_key] = uploaded_file
+        st.session_state[cache_name_key] = uploaded_file.name
+        st.session_state[cache_time_key] = datetime.now().strftime("%H:%M:%S")
+        return uploaded_file, True  # Return file and flag that it's new
+    
+    # Return session cached file if no new upload
+    if has_session_cache:
+        return st.session_state[cache_key], False
+    
+    return None, False  # No file available\n\n\n# ==============================================================================\n#  SIDEBAR -- FILE UPLOAD & MODE SELECTION\n# ==============================================================================
 
 st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/thumb/e/ef/Emerson_Electric_Company.svg/320px-Emerson_Electric_Company.svg.png", width=200)
 st.sidebar.markdown("---")
 
 st.sidebar.header("\U0001F4C2 Upload Files")
-uploaded_ob = st.sidebar.file_uploader(
-    "Orderbook (.xlsm) \u2014 Required",
-    type=["xlsm", "xlsx"],
-    help="Upload the Nashik iCenter Orderbook file (always required)"
+uploaded_ob, ob_is_new = handle_cached_file_upload(
+    "ob",
+    "Orderbook (.xlsm) — Required",
+    ["xlsm", "xlsx"],
+    "Upload the Nashik iCenter Orderbook file (always required)"
 )
 
 st.sidebar.markdown("---")
@@ -1041,39 +1304,42 @@ analysis_mode = st.sidebar.radio(
 # Show relevant file uploaders based on mode
 uploaded_stock = None
 uploaded_grn = None
+stock_is_new = False
+grn_is_new = False
 
 if analysis_mode == "\U0001F4E6 Stock Analysis":
-    st.sidebar.markdown("---")
-    uploaded_stock = st.sidebar.file_uploader(
-        "Stock (.xlsx) \u2014 Required",
-        type=["xlsx", "xlsm"],
-        help="Upload the Stock file for on-hand inventory data"
+    uploaded_stock, stock_is_new = handle_cached_file_upload(
+        "stock",
+        "Stock (.xlsx) — Required",
+        ["xlsx", "xlsm"],
+        "Upload the Stock file for on-hand inventory data"
     )
 elif analysis_mode == "\U0001F4E5 GRN Analysis":
-    st.sidebar.markdown("---")
-    uploaded_grn = st.sidebar.file_uploader(
-        "Daily Material Incoming (.xlsx) \u2014 Required",
-        type=["xlsx", "xlsm"],
-        help="Upload the Daily Material Incoming file"
+    uploaded_grn, grn_is_new = handle_cached_file_upload(
+        "grn",
+        "Daily Material Incoming (.xlsx) — Required",
+        ["xlsx", "xlsm"],
+        "Upload the Daily Material Incoming file"
     )
 elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
-    st.sidebar.markdown("---")
-    uploaded_stock = st.sidebar.file_uploader(
-        "Stock (.xlsx) \u2014 Required",
-        type=["xlsx", "xlsm"],
-        help="Upload the Stock file for on-hand inventory data"
+    uploaded_stock, stock_is_new = handle_cached_file_upload(
+        "stock",
+        "Stock (.xlsx) — Required",
+        ["xlsx", "xlsm"],
+        "Upload the Stock file for on-hand inventory data"
     )
 else:  # Combined
-    st.sidebar.markdown("---")
-    uploaded_grn = st.sidebar.file_uploader(
-        "Daily Material Incoming (.xlsx) \u2014 Required",
-        type=["xlsx", "xlsm"],
-        help="Upload the Daily Material Incoming file"
+    uploaded_grn, grn_is_new = handle_cached_file_upload(
+        "grn",
+        "Daily Material Incoming (.xlsx) — Required",
+        ["xlsx", "xlsm"],
+        "Upload the Daily Material Incoming file"
     )
-    uploaded_stock = st.sidebar.file_uploader(
-        "Stock (.xlsx) \u2014 Required",
-        type=["xlsx", "xlsm"],
-        help="Upload the Stock file for on-hand inventory data"
+    uploaded_stock, stock_is_new = handle_cached_file_upload(
+        "stock",
+        "Stock (.xlsx) — Required",
+        ["xlsx", "xlsm"],
+        "Upload the Stock file for on-hand inventory data"
     )
 
 # ==============================================================================
@@ -1107,8 +1373,23 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)" and (not uploaded
     st.stop()
 
 # -- Load Orderbook (always) --------------------------------------------------
-with st.spinner("Loading Orderbook..."):
-    df_oob, ob_sheets = load_orderbook(uploaded_ob)
+df_oob = None
+ob_sheets = None
+
+if ob_is_new or st.session_state.df_oob_cache is None:
+    # New file uploaded or no cache - load it
+    with st.spinner("Loading Orderbook..."):
+        # Convert uploaded file to BytesIO for caching compatibility
+        uploaded_ob.seek(0)
+        file_bytes = io.BytesIO(uploaded_ob.read())
+        df_oob, ob_sheets = load_orderbook(file_bytes)
+    if df_oob is not None:
+        st.session_state.df_oob_cache = df_oob
+        st.session_state.ob_sheets_cache = ob_sheets
+else:
+    # Use cached data
+    df_oob = st.session_state.df_oob_cache
+    ob_sheets = st.session_state.ob_sheets_cache
 
 if df_oob is None:
     st.stop()
@@ -1125,21 +1406,47 @@ if "Sales Status" in df_oob.columns:
 
 # -- Load GRN (if needed) -----------------------------------------------------
 df_grn = None
+grn_sheets = None
 df_grn_today = pd.DataFrame()
 selected_date = date.today()
 
 if uploaded_grn:
-    with st.spinner("Loading Daily GRN..."):
-        df_grn, grn_sheets = load_grn(uploaded_grn)
+    if grn_is_new or st.session_state.df_grn_cache is None:
+        # New file uploaded or no cache - load it
+        with st.spinner("Loading Daily GRN..."):
+            # Convert uploaded file to BytesIO for caching compatibility
+            uploaded_grn.seek(0)
+            file_bytes = io.BytesIO(uploaded_grn.read())
+            df_grn, grn_sheets = load_grn(file_bytes)
+        if df_grn is not None:
+            st.session_state.df_grn_cache = df_grn
+            st.session_state.grn_sheets_cache = grn_sheets
+    else:
+        # Use cached data
+        df_grn = st.session_state.df_grn_cache
+        grn_sheets = st.session_state.grn_sheets_cache
+    
     if df_grn is None:
         st.stop()
 
 # -- Load Stock (if needed) ----------------------------------------------------
 df_stock = None
 stock_map = {}
+
 if uploaded_stock:
-    with st.spinner("Loading Stock..."):
-        df_stock = load_stock(uploaded_stock)
+    if stock_is_new or st.session_state.df_stock_cache is None:
+        # New file uploaded or no cache - load it
+        with st.spinner("Loading Stock..."):
+            # Convert uploaded file to BytesIO for caching compatibility
+            uploaded_stock.seek(0)
+            file_bytes = io.BytesIO(uploaded_stock.read())
+            df_stock = load_stock(file_bytes)
+        if df_stock is not None:
+            st.session_state.df_stock_cache = df_stock
+    else:
+        # Use cached data
+        df_stock = st.session_state.df_stock_cache
+    
     if df_stock is not None:
         stock_map = get_stock_map(df_stock)
         st.sidebar.success(f"\u2705 Stock loaded: {len(df_stock):,} rows, {len(stock_map):,} unique items")
@@ -1206,27 +1513,39 @@ project_sequence = st.session_state["project_sequence"]
 if analysis_mode == "\U0001F4E6 Stock Analysis":
 
     # -- KPI Cards (Stock mode) ------------------------------------------------
-    total_open_qty = df_oob_filtered["Open Qty"].sum()
-    total_unique_components = df_oob_filtered["Component Code"].nunique()
+    # Filter to components with open qty in Production Open status
+    component_open_qty = df_oob_filtered.groupby("Component Code")["Open Qty"].sum()
+    components_with_open_qty = {c: qty for c, qty in component_open_qty.items() if qty > 0}
+    total_unique_components = len(components_with_open_qty)
     total_projects = df_oob_filtered[["Project Num", "Project Name"]].drop_duplicates().shape[0]
-    components_in_stock = sum(1 for c in df_oob_filtered["Component Code"].unique() if stock_map.get(c, 0) > 0)
-    total_stock_qty = sum(stock_map.get(c, 0) for c in df_oob_filtered["Component Code"].unique())
-    shortage_components = sum(1 for c in df_oob_filtered.groupby("Component Code")["Open Qty"].sum().items()
-                              if stock_map.get(c[0], 0) < c[1])
+    
+    # Calculate availability breakdown for components with open qty
+    fully_available = sum(
+        1 for c, open_qty in components_with_open_qty.items() 
+        if stock_map.get(c, 0) >= open_qty
+    )
+    partially_available = sum(
+        1 for c, open_qty in components_with_open_qty.items() 
+        if 0 < stock_map.get(c, 0) < open_qty
+    )
+    zero_availability = sum(
+        1 for c, open_qty in components_with_open_qty.items() 
+        if stock_map.get(c, 0) == 0
+    )
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
-        st.markdown(f'<div class="metric-card shortage"><h2>{total_open_qty:,.0f}</h2><p>Total Open Qty</p></div>', unsafe_allow_html=True)
-    with c2:
-        st.markdown(f'<div class="metric-card available"><h2>{total_stock_qty:,.0f}</h2><p>Total Stock Qty (Matching)</p></div>', unsafe_allow_html=True)
-    with c3:
-        st.markdown(f'<div class="metric-card incoming"><h2>{components_in_stock}</h2><p>Components In Stock</p></div>', unsafe_allow_html=True)
-    with c4:
         st.markdown(f'<div class="metric-card project"><h2>{total_projects}</h2><p>Active Projects</p></div>', unsafe_allow_html=True)
-    with c5:
+    with c2:
         st.markdown(f'<div class="metric-card"><h2>{total_unique_components}</h2><p>Unique Components Needed</p></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="metric-card available"><h2>{fully_available}</h2><p>Fully Available</p></div>', unsafe_allow_html=True)
+    with c4:
+        st.markdown(f'<div class="metric-card project"><h2>{partially_available}</h2><p>Partially Available</p></div>', unsafe_allow_html=True)
+    with c5:
+        st.markdown(f'<div class="metric-card shortage"><h2>{zero_availability}</h2><p>Shortage</p></div>', unsafe_allow_html=True)
     with c6:
-        st.markdown(f'<div class="metric-card shortage"><h2>{shortage_components}</h2><p>Components in Shortage</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card incoming"><h2>Component-Level</h2><p>Analysis Below</p></div>', unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -1249,8 +1568,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
         display_cols = [
             "Project Num", "Project Name", "Unique Orders", "Unique Items (FG)",
             "Unique Components", "Components Available", "Components In Stock",
-            "Required Quantity", "Quantity Issued", "Open Qty", "Fulfillment %",
-            "Stock Qty",
+            "Fulfillment %",
         ]
         available_cols = [c for c in display_cols if c in proj_summary.columns]
         proj_display = proj_summary[available_cols].copy()
@@ -1267,11 +1585,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
         styled = style_method(
             color_fulfillment, subset=["Fulfillment %"]
         ).format({
-            "Required Quantity": "{:,.0f}",
-            "Quantity Issued": "{:,.0f}",
-            "Open Qty": "{:,.0f}",
             "Fulfillment %": "{:.1f}%",
-            "Stock Qty": "{:,.0f}",
         })
         display_dataframe_arrow_safe(styled, width='stretch', height=500)
 
@@ -1319,10 +1633,28 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
         if len(stock_by_proj) == 0:
             st.warning("No stock items matched with Orderbook components.")
         else:
-            m1, m2, m3 = st.columns(3)
+            # Calculate fulfillment breakdown for stock items
+            component_open_qty = df_oob_filtered.groupby("Component Code")["Open Qty"].sum()
+            components_with_stock = set(stock_by_proj["Component Code"].unique())
+            
+            fully_available_stock = sum(
+                1 for c in components_with_stock 
+                if c in component_open_qty and component_open_qty[c] > 0 and stock_map.get(c, 0) >= component_open_qty[c]
+            )
+            partially_available_stock = sum(
+                1 for c in components_with_stock 
+                if c in component_open_qty and 0 < stock_map.get(c, 0) < component_open_qty[c]
+            )
+            shortage_stock = sum(
+                1 for c in components_with_stock 
+                if c in component_open_qty and stock_map.get(c, 0) == 0 and component_open_qty[c] > 0
+            )
+            
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Projects Impacted", stock_by_proj["Project Name"].nunique())
-            m2.metric("Unique Components in Stock", stock_by_proj["Component Code"].nunique())
-            m3.metric("Total Open Qty", f"{stock_by_proj['Open Qty'].sum():,.0f}")
+            m2.metric("✅ Fully Available", fully_available_stock)
+            m3.metric("🟠 Partially Available", partially_available_stock)
+            m4.metric("❌ Shortage", shortage_stock)
 
             st.markdown("---")
 
@@ -1339,9 +1671,8 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
             stock_proj_display.insert(0, "Serial No.", range(1, len(stock_proj_display) + 1))
 
             stock_proj_display_cols = [
-                "Serial No.", "Priority", "Project Name", "Order Number", "Component Code",
-                "Component Desc", "Required Quantity", "Quantity Issued",
-                "Open Qty", "Stock Qty", "Fulfillable Work Orders",
+                "Serial No.", "Priority", "Project Name", "Component Code",
+                "Component Desc", "Fulfillable Work Orders",
             ]
             available_display_cols = [c for c in stock_proj_display_cols if c in stock_proj_display.columns]
 
@@ -1355,10 +1686,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
             style_method_sp = getattr(stock_proj_styled.style, "map", None) or stock_proj_styled.style.applymap
             stock_proj_styled_df = style_method_sp(
                 color_priority_stock, subset=["Priority"]
-            ).format({
-                "Required Quantity": "{:,.0f}", "Quantity Issued": "{:,.0f}",
-                "Open Qty": "{:,.0f}", "Stock Qty": "{:,.0f}",
-            })
+            ).format({})
             st.dataframe(stock_proj_styled_df, width='stretch', height=600)
 
             csv_stock_proj = stock_proj_display[available_display_cols].to_csv(index=False)
@@ -1396,7 +1724,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
         with filter_col1:
             avail_filter = st.multiselect(
                 "Filter by Availability:",
-                options=["\u2705 Surplus / Available", "\u274C Shortage"],
+                options=["\u2705 Surplus / Available", "\U0001F536 Partially Available", "\u274C Shortage"],
                 default=[],
                 key="stock_avail_filter"
             )
@@ -1407,7 +1735,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
 
         stock_cols = [
             "Component Code", "Component Desc", "Required Quantity", "Quantity Issued",
-            "Open Qty", "Stock Qty", "Surplus / Deficit", "Total Available", "Availability Status"
+            "Open Qty", "Stock Qty", "Surplus / Deficit", "Availability Status"
         ]
         available_stock_cols = [c for c in stock_cols if c in stock_display.columns]
 
@@ -1420,13 +1748,15 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
         st.download_button("\U0001F4E5 Download Stock Analysis", csv_stock, "component_stock_analysis.csv", "text/csv")
 
         st.markdown("---")
-        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
         surplus_count = (stock_analysis["Availability Status"] == "\u2705 Surplus / Available").sum()
+        partial_count = (stock_analysis["Availability Status"] == "\U0001F536 Partially Available").sum()
         shortage_count = (stock_analysis["Availability Status"] == "\u274C Shortage").sum()
         sc1.metric("\u2705 Surplus / Available", surplus_count)
-        sc2.metric("\u274C Shortage", shortage_count)
-        sc3.metric("Unique Items in Stock", len(stock_map))
-        sc4.metric("Total Stock Qty", f"{sum(stock_map.values()):,.0f}")
+        sc2.metric("\U0001F536 Partially Available", partial_count)
+        sc3.metric("\u274C Shortage", shortage_count)
+        sc4.metric("Unique Items in Stock", len(stock_map))
+        sc5.metric("Total Stock Qty", f"{sum(stock_map.values()):,.0f}")
 
     # TAB S4: Analytics (Stock)
     with tab_s4:
@@ -1449,10 +1779,6 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
         proj_summary_chart["Open/Total Label"] = (
             proj_summary_chart["Open Components"].astype(str) + "/" + proj_summary_chart["Unique Components"].astype(str)
         )
-        # Add Open Qty per project for filtering/sorting
-        proj_open_qty = df_oob_filtered.groupby("Project Name", as_index=False)["Open Qty"].sum().rename(columns={"Open Qty": "Total Open Qty"})
-        proj_summary_chart = proj_summary_chart.merge(proj_open_qty, on="Project Name", how="left")
-        proj_summary_chart["Total Open Qty"] = proj_summary_chart["Total Open Qty"].fillna(0)
 
         # Filters
         st.markdown("##### \U0001F50D Filters & Sorting")
@@ -1461,7 +1787,6 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
             sort_option_s = st.selectbox("Sort by:", [
                 "Open Components (desc)", "Open Components (asc)",
                 "Fulfillment % (asc)", "Fulfillment % (desc)",
-                "Total Open Qty (desc)", "Total Open Qty (asc)",
                 "Project Name (A-Z)",
             ], key="stock_analytics_sort")
         with fc2:
@@ -1490,8 +1815,6 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
             "Open Components (asc)": ("Open Components", True),
             "Fulfillment % (asc)": ("Component Fulfillment", True),
             "Fulfillment % (desc)": ("Component Fulfillment", False),
-            "Total Open Qty (desc)": ("Total Open Qty", False),
-            "Total Open Qty (asc)": ("Total Open Qty", True),
             "Project Name (A-Z)": ("Project Name", True),
         }
         sort_col, sort_asc = sort_map.get(sort_option_s, ("Open Components", False))
@@ -1532,7 +1855,7 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
         st.markdown("---")
         st.subheader("Project Analytics Table")
         analytics_table_s = proj_filtered[["Project Name", "Unique Components", "Open Components",
-                                           "Component Fulfillment", "Total Open Qty"]].reset_index(drop=True)
+                                           "Component Fulfillment"]].reset_index(drop=True)
         analytics_table_s.index = analytics_table_s.index + 1
         analytics_table_s.index.name = "Sr."
         st.dataframe(analytics_table_s, width='stretch', height=min(500, 40 + len(analytics_table_s) * 35))
@@ -1540,28 +1863,19 @@ if analysis_mode == "\U0001F4E6 Stock Analysis":
 
         st.markdown("---")
 
-        col3, col4 = st.columns(2)
-        with col3:
-            stock_full = build_component_stock_analysis(df_oob_filtered, stock_map)
-            avail_counts = stock_full["Availability Status"].value_counts().reset_index()
-            avail_counts.columns = ["Status", "Count"]
-            fig3 = px.pie(
-                avail_counts, values="Count", names="Status",
-                title="Component Stock Availability Status",
-                color_discrete_map={
-                    "\u2705 Surplus / Available": "#2ecc71",
-                    "\u274C Shortage": "#e74c3c",
-                }
-            )
-            st.plotly_chart(fig3, width='stretch')
-
-        with col4:
-            avail_counts2 = df_oob_filtered["Availability"].value_counts().reset_index()
-            avail_counts2.columns = ["Availability", "Count"]
-            fig4 = px.pie(avail_counts2, values="Count", names="Availability",
-                          title="Orderbook Availability Status",
-                          color_discrete_map={"Available": "#2ecc71", "Shortage": "#e74c3c"})
-            st.plotly_chart(fig4, width='stretch')
+        stock_full = build_component_stock_analysis(df_oob_filtered, stock_map)
+        avail_counts = stock_full["Availability Status"].value_counts().reset_index()
+        avail_counts.columns = ["Status", "Count"]
+        fig3 = px.pie(
+            avail_counts, values="Count", names="Status",
+            title="Component Stock Availability Status",
+            color_discrete_map={
+                "\u2705 Surplus / Available": "#2ecc71",
+                "\U0001F536 Partially Available": "#f39c12",
+                "\u274C Shortage": "#e74c3c",
+            }
+        )
+        st.plotly_chart(fig3, use_container_width=True)
 
         st.markdown("---")
         st.subheader("\U0001F4E6 Stock Summary")
@@ -1713,9 +2027,8 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
 
         display_cols = [
             "Project Num", "Project Name", "Unique Orders", "Unique Items (FG)",
-            "Unique Components", "Components Available",
-            "Required Quantity", "Quantity Issued", "Open Qty", "Fulfillment %",
-            "Components Received Today", "Qty Received Today",
+            "Unique Components", "Components Available", "Components Received Today",
+            "Fulfillment %",
         ]
         available_cols = [c for c in display_cols if c in proj_summary.columns]
         proj_display = proj_summary[available_cols].copy()
@@ -1732,11 +2045,7 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
         styled = style_method(
             color_fulfillment, subset=["Fulfillment %"]
         ).format({
-            "Required Quantity": "{:,.0f}",
-            "Quantity Issued": "{:,.0f}",
-            "Open Qty": "{:,.0f}",
             "Fulfillment %": "{:.1f}%",
-            "Qty Received Today": "{:,.0f}",
         })
         st.dataframe(styled, width='stretch', height=500)
 
@@ -1942,10 +2251,6 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
         proj_summary_chart["Open/Total Label"] = (
             proj_summary_chart["Open Components"].astype(str) + "/" + proj_summary_chart["Unique Components"].astype(str)
         )
-        proj_open_qty = df_oob_filtered.groupby("Project Name", as_index=False)["Open Qty"].sum().rename(columns={"Open Qty": "Total Open Qty"})
-        proj_summary_chart = proj_summary_chart.merge(proj_open_qty, on="Project Name", how="left")
-        proj_summary_chart["Total Open Qty"] = proj_summary_chart["Total Open Qty"].fillna(0)
-
         # Filters
         st.markdown("##### \U0001F50D Filters & Sorting")
         fc1, fc2, fc3 = st.columns(3)
@@ -1953,7 +2258,6 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
             sort_option_g = st.selectbox("Sort by:", [
                 "Open Components (desc)", "Open Components (asc)",
                 "Fulfillment % (asc)", "Fulfillment % (desc)",
-                "Total Open Qty (desc)", "Total Open Qty (asc)",
                 "Project Name (A-Z)",
             ], key="grn_analytics_sort")
         with fc2:
@@ -1982,8 +2286,6 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
             "Open Components (asc)": ("Open Components", True),
             "Fulfillment % (asc)": ("Component Fulfillment", True),
             "Fulfillment % (desc)": ("Component Fulfillment", False),
-            "Total Open Qty (desc)": ("Total Open Qty", False),
-            "Total Open Qty (asc)": ("Total Open Qty", True),
             "Project Name (A-Z)": ("Project Name", True),
         }
         sort_col, sort_asc = sort_map.get(sort_option_g, ("Open Components", False))
@@ -2020,11 +2322,14 @@ elif analysis_mode == "\U0001F4E5 GRN Analysis":
             fig2.update_layout(yaxis=dict(autorange="reversed"), height=chart_height)
             st.plotly_chart(fig2, width='stretch')
 
+            st.markdown("---")
+            st.info("🔍 Detailed GRN-by-quantity analytics are available in the **Component Reconciliation** tab for granular component-level insights.")
+
         # Downloadable table
         st.markdown("---")
         st.subheader("Project Analytics Table")
         analytics_table_g = proj_filtered[["Project Name", "Unique Components", "Open Components",
-                                           "Component Fulfillment", "Total Open Qty"]].reset_index(drop=True)
+                                           "Component Fulfillment"]].reset_index(drop=True)
         analytics_table_g.index = analytics_table_g.index + 1
         analytics_table_g.index.name = "Sr."
         st.dataframe(analytics_table_g, width='stretch', height=min(500, 40 + len(analytics_table_g) * 35))
@@ -2218,9 +2523,8 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
 
         display_cols = [
             "Project Num", "Project Name", "Unique Orders", "Unique Items (FG)",
-            "Unique Components", "Components Available",
-            "Required Quantity", "Quantity Issued", "Open Qty", "Fulfillment %",
-            "Stock Qty", "Components Received Today", "Qty Received Today",
+            "Unique Components", "Components Available", "Components Received Today",
+            "Fulfillment %",
         ]
         proj_display = proj_summary[display_cols].copy()
 
@@ -2236,12 +2540,7 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
         styled = style_method(
             color_fulfillment, subset=["Fulfillment %"]
         ).format({
-            "Required Quantity": "{:,.0f}",
-            "Quantity Issued": "{:,.0f}",
-            "Open Qty": "{:,.0f}",
             "Fulfillment %": "{:.1f}%",
-            "Stock Qty": "{:,.0f}",
-            "Qty Received Today": "{:,.0f}",
         })
 
         st.dataframe(styled, width='stretch', height=500)
@@ -2474,9 +2773,6 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
         proj_summary_chart["Open/Total Label"] = (
             proj_summary_chart["Open Components"].astype(str) + "/" + proj_summary_chart["Unique Components"].astype(str)
         )
-        proj_open_qty = df_oob_filtered.groupby("Project Name", as_index=False)["Open Qty"].sum().rename(columns={"Open Qty": "Total Open Qty"})
-        proj_summary_chart = proj_summary_chart.merge(proj_open_qty, on="Project Name", how="left")
-        proj_summary_chart["Total Open Qty"] = proj_summary_chart["Total Open Qty"].fillna(0)
 
         # Filters
         st.markdown("##### \U0001F50D Filters & Sorting")
@@ -2485,7 +2781,6 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
             sort_option_c = st.selectbox("Sort by:", [
                 "Open Components (desc)", "Open Components (asc)",
                 "Fulfillment % (asc)", "Fulfillment % (desc)",
-                "Total Open Qty (desc)", "Total Open Qty (asc)",
                 "Project Name (A-Z)",
             ], key="combined_analytics_sort")
         with fc2:
@@ -2514,8 +2809,6 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
             "Open Components (asc)": ("Open Components", True),
             "Fulfillment % (asc)": ("Component Fulfillment", True),
             "Fulfillment % (desc)": ("Component Fulfillment", False),
-            "Total Open Qty (desc)": ("Total Open Qty", False),
-            "Total Open Qty (asc)": ("Total Open Qty", True),
             "Project Name (A-Z)": ("Project Name", True),
         }
         sort_col, sort_asc = sort_map.get(sort_option_c, ("Open Components", False))
@@ -2557,7 +2850,7 @@ elif analysis_mode == "\U0001F4CA Combined View (Stock + GRN)":
         st.markdown("---")
         st.subheader("Project Analytics Table")
         analytics_table_c = proj_filtered[["Project Name", "Unique Components", "Open Components",
-                                           "Component Fulfillment", "Total Open Qty"]].reset_index(drop=True)
+                                           "Component Fulfillment"]].reset_index(drop=True)
         analytics_table_c.index = analytics_table_c.index + 1
         analytics_table_c.index.name = "Sr."
         st.dataframe(analytics_table_c, width='stretch', height=min(500, 40 + len(analytics_table_c) * 35))
@@ -2772,10 +3065,7 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
         # -- KPI Cards (Supply Eligible) -------------------------------------------
         so_total_projects = so_data["Project Name"].nunique()
         so_total_components = so_data["Component Code"].nunique()
-        so_total_open_qty = so_data["Open Qty"].sum()
-        so_total_stock_qty = sum(stock_map.get(c, 0) for c in so_data["Component Code"].unique())
         so_comp_in_stock = sum(1 for c in so_data["Component Code"].unique() if stock_map.get(c, 0) > 0)
-        so_overall_qty_pct = min(100.0, (so_total_stock_qty / so_total_open_qty * 100)) if so_total_open_qty > 0 else 100.0
         so_overall_comp_pct = (so_comp_in_stock / so_total_components * 100) if so_total_components > 0 else 100.0
 
         c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -2784,13 +3074,13 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
         with c2:
             st.markdown(f'<div class="metric-card"><h2>{so_total_components}</h2><p>Unique Components</p></div>', unsafe_allow_html=True)
         with c3:
-            st.markdown(f'<div class="metric-card shortage"><h2>{so_total_open_qty:,.0f}</h2><p>Total Open Qty</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card incoming"><h2>{so_comp_in_stock}/{so_total_components}</h2><p>Components Available</p></div>', unsafe_allow_html=True)
         with c4:
-            st.markdown(f'<div class="metric-card available"><h2>{so_total_stock_qty:,.0f}</h2><p>Stock Qty (Matching)</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card available"><h2>{so_overall_comp_pct:.1f}%</h2><p>Fulfillment Capacity</p></div>', unsafe_allow_html=True)
         with c5:
-            st.markdown(f'<div class="metric-card incoming"><h2>{so_overall_qty_pct:.1f}%</h2><p>Qty Fulfillment</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card incoming"><h2>Component-Level</h2><p>Analytics Below</p></div>', unsafe_allow_html=True)
         with c6:
-            st.markdown(f'<div class="metric-card incoming"><h2>{so_overall_comp_pct:.1f}%</h2><p>Component Coverage</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card incoming"><h2>No Qty View</h2><p>At Project Scale</p></div>', unsafe_allow_html=True)
 
         st.markdown("---")
 
@@ -2846,15 +3136,20 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
             )
             so_proj = so_proj.sort_values("Open Qty", ascending=False).reset_index(drop=True)
 
+            # --- Add component ratio column for display ---
+            so_proj["Component Ratio"] = (
+                so_proj["Components In Stock"].astype(int).astype(str) + "/" +
+                so_proj["Unique Components"].astype(int).astype(str)
+            )
+            
             # --- Project-wise table -------------------------------------------
             st.markdown("##### Project-wise Supply Eligible Fulfillment")
             so_display = so_proj.copy()
             so_display.insert(0, "Sr.", range(1, len(so_display) + 1))
             so_display_cols = [
                 "Sr.", "Project Num", "Project Name", "Unique Orders",
-                "Unique Components", "Components In Stock",
-                "Open Qty", "Stock Qty",
-                "Qty Fulfillment %", "Component Fulfillment %",
+                "Unique Components", "Component Ratio", "Components In Stock",
+                "Component Fulfillment %",
             ]
             avail_cols = [c for c in so_display_cols if c in so_display.columns]
 
@@ -2870,10 +3165,9 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
             so_styled = so_display[avail_cols].copy()
             style_fn = getattr(so_styled.style, "map", None) or so_styled.style.applymap
             so_styled_df = style_fn(
-                color_fulfillment_so, subset=["Qty Fulfillment %", "Component Fulfillment %"]
+                color_fulfillment_so, subset=["Component Fulfillment %"]
             ).format({
-                "Open Qty": "{:,.0f}", "Stock Qty": "{:,.0f}",
-                "Qty Fulfillment %": "{:.1f}%", "Component Fulfillment %": "{:.1f}%",
+                "Component Fulfillment %": "{:.1f}%",
             })
             st.dataframe(so_styled_df, width='stretch', height=min(600, 38 + len(so_display) * 35))
 
@@ -2919,10 +3213,11 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
                 100.0
             )
             so_proj_a["Open Components"] = so_proj_a["Unique Components"] - so_proj_a["Components In Stock"]
-            so_proj_a["Open/Total Label"] = (
+            so_proj_a["Component Ratio"] = (
                 so_proj_a["Components In Stock"].astype(int).astype(str) + "/" +
                 so_proj_a["Unique Components"].astype(int).astype(str)
             )
+            so_proj_a["Open/Total Label"] = so_proj_a["Component Ratio"]
 
             # --- Filters & Sort -----------------------------------------------
             st.markdown("##### \U0001F50D Filters & Sorting")
@@ -2983,50 +3278,28 @@ elif analysis_mode == "\U0001F4CB Supply Eligible Analysis":
             with col_b:
                 fig_so2 = px.bar(
                     so_filtered, x="Component Fulfillment %", y="Project Name", orientation="h",
-                    title="Component Coverage % (Unique Components in Stock / Total)",
+                    title="Component Coverage % (Available / Total Components)",
                     color="Component Fulfillment %", color_continuous_scale="RdYlGn",
-                    text="Open/Total Label",
+                    text="Component Ratio",
+                    custom_data=["Component Ratio"],
                 )
-                fig_so2.update_traces(textposition="outside")
+                fig_so2.update_traces(
+                    textposition="outside",
+                    hovertemplate="<b>%{y}</b><br>Component Coverage: %{x:.1f}%<br>Available: %{customdata[0]}<extra></extra>"
+                )
                 fig_so2.update_layout(yaxis=dict(autorange="reversed"), height=chart_h)
                 st.plotly_chart(fig_so2, use_container_width=True)
 
             st.markdown("---")
-
-            col_c, col_d = st.columns(2)
-            with col_c:
-                fig_so3 = px.bar(
-                    so_filtered, x="Open Qty", y="Project Name", orientation="h",
-                    title="Open Qty by Project",
-                    color="Qty Fulfillment %", color_continuous_scale="RdYlGn",
-                    text=so_filtered["Open Qty"].apply(lambda x: f"{x:,.0f}"),
-                )
-                fig_so3.update_traces(textposition="outside")
-                fig_so3.update_layout(yaxis=dict(autorange="reversed"), height=chart_h)
-                st.plotly_chart(fig_so3, use_container_width=True)
-
-            with col_d:
-                so_bins = pd.cut(
-                    so_filtered["Qty Fulfillment %"],
-                    bins=[-1, 25, 50, 75, 100],
-                    labels=["0-25%", "26-50%", "51-75%", "76-100%"]
-                ).value_counts().reset_index()
-                so_bins.columns = ["Range", "Projects"]
-                so_bins = so_bins[so_bins["Projects"] > 0]
-                fig_so4 = px.pie(
-                    so_bins, values="Projects", names="Range",
-                    title="Qty Fulfillment Distribution",
-                    color_discrete_sequence=["#e74c3c", "#f39c12", "#f1c40f", "#2ecc71"],
-                )
-                st.plotly_chart(fig_so4, use_container_width=True)
+            st.info("💡 Quantity-wise analytics (Open Qty, Stock Qty) are shown only at **component level** in the Project Search tab for detailed insights.")
 
             # Analytics table
             st.markdown("---")
             st.subheader("Supply Eligible Analytics Table")
             so_tbl = so_filtered[[
-                "Project Name", "Unique Components", "Components In Stock",
-                "Open Components", "Open Qty", "Stock Qty",
-                "Qty Fulfillment %", "Component Fulfillment %"
+                "Project Name", "Unique Components", "Component Ratio",
+                "Components In Stock", "Open Components",
+                "Component Fulfillment %"
             ]].reset_index(drop=True)
             so_tbl.index = so_tbl.index + 1
             so_tbl.index.name = "Sr."
